@@ -1,15 +1,22 @@
 package com.cognistence.mindbend_gemini_live_audio
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioFocusRequest
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
@@ -41,6 +48,7 @@ class MindbendGeminiLiveAudioPlugin :
     private var audioManager: AudioManager? = null
     private var previousAudioMode: Int? = null
     private var previousSpeakerphoneOn: Boolean? = null
+    private var audioFocusRequest: AudioFocusRequest? = null
 
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
@@ -50,9 +58,74 @@ class MindbendGeminiLiveAudioPlugin :
 
     private var captureThread: Thread? = null
     private var playbackStarted = false
+    private var captureFirstChunkDelivered = false
 
     private var disableNoiseSuppressor = false
     private var disableAutomaticGainControl = false
+    private var noisyReceiverRegistered = false
+
+    private val audioFocusChangeListener =
+        AudioManager.OnAudioFocusChangeListener { focusChange ->
+            val name =
+                when (focusChange) {
+                    AudioManager.AUDIOFOCUS_GAIN -> "gain"
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT -> "gain_transient"
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE -> "gain_transient_exclusive"
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK -> "gain_transient_may_duck"
+                    AudioManager.AUDIOFOCUS_LOSS -> "loss"
+                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> "loss_transient"
+                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> "loss_transient_can_duck"
+                    else -> "unknown_$focusChange"
+                }
+            emitEvent(
+                "audio_focus_change",
+                mapOf("focusChange" to name),
+            )
+            if (
+                focusChange == AudioManager.AUDIOFOCUS_LOSS ||
+                    focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
+                    focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
+            ) {
+                emitEvent("interruption_began")
+            } else if (
+                focusChange == AudioManager.AUDIOFOCUS_GAIN ||
+                    focusChange == AudioManager.AUDIOFOCUS_GAIN_TRANSIENT ||
+                    focusChange == AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE ||
+                    focusChange == AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+            ) {
+                emitEvent("interruption_ended")
+            }
+        }
+
+    private val becomingNoisyReceiver =
+        object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (AudioManager.ACTION_AUDIO_BECOMING_NOISY == intent?.action) {
+                    emitEvent("route_changed", mapOf("reason" to "becoming_noisy", "route" to currentRouteDescription()))
+                }
+            }
+        }
+
+    private val audioDeviceCallback: AudioDeviceCallback? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            object : AudioDeviceCallback() {
+                override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                    emitEvent(
+                        "route_changed",
+                        mapOf("reason" to "devices_added", "route" to currentRouteDescription()),
+                    )
+                }
+
+                override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                    emitEvent(
+                        "route_changed",
+                        mapOf("reason" to "devices_removed", "route" to currentRouteDescription()),
+                    )
+                }
+            }
+        } else {
+            null
+        }
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         applicationContext = binding.applicationContext
@@ -65,6 +138,7 @@ class MindbendGeminiLiveAudioPlugin :
             object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
                     capturedAudioSink = events
+                    emitEvent("capture_sink_attached")
                 }
 
                 override fun onCancel(arguments: Any?) {
@@ -78,6 +152,7 @@ class MindbendGeminiLiveAudioPlugin :
             object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
                     eventSink = events
+                    emitEvent("event_sink_attached")
                 }
 
                 override fun onCancel(arguments: Any?) {
@@ -147,6 +222,8 @@ class MindbendGeminiLiveAudioPlugin :
             previousSpeakerphoneOn = audioManager?.isSpeakerphoneOn
             audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
             audioManager?.isSpeakerphoneOn = true
+            requestAudioFocus()
+            registerRouteObservers()
 
             val captureBufferSize = maxOf(
                 AudioRecord.getMinBufferSize(
@@ -232,12 +309,35 @@ class MindbendGeminiLiveAudioPlugin :
             noiseSuppressor = ns
             automaticGainControl = agc
             playbackStarted = false
+            captureFirstChunkDelivered = false
             isSessionRunning.set(true)
             playbackGeneration.incrementAndGet()
 
             track.play()
             record.startRecording()
             startCaptureLoop(captureBufferSize)
+            emitEvent(
+                "session_ready",
+                mapOf(
+                    "captureSampleRateHz" to CAPTURE_SAMPLE_RATE_HZ,
+                    "playbackSampleRateHz" to PLAYBACK_SAMPLE_RATE_HZ,
+                    "route" to currentRouteDescription(),
+                ),
+            )
+            emitEvent(
+                "capture_ready",
+                mapOf(
+                    "captureSampleRateHz" to CAPTURE_SAMPLE_RATE_HZ,
+                    "route" to currentRouteDescription(),
+                ),
+            )
+            emitEvent(
+                "playback_ready",
+                mapOf(
+                    "playbackSampleRateHz" to PLAYBACK_SAMPLE_RATE_HZ,
+                    "route" to currentRouteDescription(),
+                ),
+            )
 
             return startResult(
                 aecActive = true,
@@ -247,7 +347,7 @@ class MindbendGeminiLiveAudioPlugin :
                 errorCode = null,
             )
         } catch (t: Throwable) {
-            emitEvent("error:android_start_failed")
+            emitEvent("error", mapOf("code" to "android_start_failed"))
             stopSessionInternal(restoreAudioState = true)
             return fallbackResult("android_start_failed")
         }
@@ -264,7 +364,7 @@ class MindbendGeminiLiveAudioPlugin :
                 if (read > 0) {
                     emitCapturedAudio(if (read == buffer.size) buffer.clone() else buffer.copyOf(read))
                 } else if (read < 0) {
-                    emitEvent("error:android_capture_read_$read")
+                    emitEvent("error", mapOf("code" to "android_capture_read_$read"))
                     break
                 }
             }
@@ -272,6 +372,103 @@ class MindbendGeminiLiveAudioPlugin :
             name = "MindbendGeminiLiveAudioCapture"
             start()
         }
+    }
+
+    private fun requestAudioFocus() {
+        val manager = audioManager ?: return
+        val attributes =
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest =
+                AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                    .setOnAudioFocusChangeListener(audioFocusChangeListener)
+                    .setAudioAttributes(attributes)
+                    .setAcceptsDelayedFocusGain(false)
+                    .build()
+            val result = manager.requestAudioFocus(audioFocusRequest!!)
+            emitEvent(
+                "audio_focus_request",
+                mapOf("granted" to (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED)),
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            val result =
+                manager.requestAudioFocus(
+                    audioFocusChangeListener,
+                    AudioManager.STREAM_VOICE_CALL,
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
+                )
+            emitEvent(
+                "audio_focus_request",
+                mapOf("granted" to (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED)),
+            )
+        }
+    }
+
+    private fun abandonAudioFocus() {
+        val manager = audioManager ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest?.let { manager.abandonAudioFocusRequest(it) }
+            audioFocusRequest = null
+        } else {
+            @Suppress("DEPRECATION")
+            manager.abandonAudioFocus(audioFocusChangeListener)
+        }
+    }
+
+    private fun registerRouteObservers() {
+        if (!noisyReceiverRegistered) {
+            applicationContext.registerReceiver(
+                becomingNoisyReceiver,
+                IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY),
+            )
+            noisyReceiverRegistered = true
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            audioDeviceCallback?.let { callback ->
+                audioManager?.registerAudioDeviceCallback(callback, mainHandler)
+            }
+        }
+        emitEvent("route_applied", mapOf("route" to currentRouteDescription()))
+    }
+
+    private fun unregisterRouteObservers() {
+        if (noisyReceiverRegistered) {
+            try {
+                applicationContext.unregisterReceiver(becomingNoisyReceiver)
+            } catch (_: Throwable) {
+            }
+            noisyReceiverRegistered = false
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            audioDeviceCallback?.let { callback ->
+                audioManager?.unregisterAudioDeviceCallback(callback)
+            }
+        }
+    }
+
+    private fun currentRouteDescription(): String {
+        val manager = audioManager
+        if (manager == null) return "unknown"
+        val parts = mutableListOf<String>()
+        parts += "speaker=${manager.isSpeakerphoneOn}"
+        parts += "mode=${manager.mode}"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val outputs =
+                manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).joinToString(",") { device ->
+                    "${device.type}:${device.productName ?: "unknown"}"
+                }
+            val inputs =
+                manager.getDevices(AudioManager.GET_DEVICES_INPUTS).joinToString(",") { device ->
+                    "${device.type}:${device.productName ?: "unknown"}"
+                }
+            parts += "inputs=[$inputs]"
+            parts += "outputs=[$outputs]"
+        }
+        return parts.joinToString(" ")
     }
 
     private fun pushPlayback(bytes: ByteArray) {
@@ -286,7 +483,10 @@ class MindbendGeminiLiveAudioPlugin :
             val track = audioTrack ?: return@execute
             if (!playbackStarted) {
                 playbackStarted = true
-                emitEvent("playback_started")
+                emitEvent(
+                    "playback_started",
+                    mapOf("bytes" to bytes.size, "route" to currentRouteDescription()),
+                )
             }
             var offset = 0
             while (offset < bytes.size && isSessionRunning.get()) {
@@ -298,7 +498,7 @@ class MindbendGeminiLiveAudioPlugin :
                     if (generationAtEnqueue != playbackGeneration.get()) {
                         return@execute
                     }
-                    emitEvent("error:android_playback_write_$written")
+                    emitEvent("error", mapOf("code" to "android_playback_write_$written"))
                     return@execute
                 }
                 offset += written
@@ -319,10 +519,10 @@ class MindbendGeminiLiveAudioPlugin :
                 track.flush()
                 track.play()
                 playbackStarted = false
-                emitEvent("interrupted")
-                emitEvent("playback_stopped")
+                emitEvent("interrupted", mapOf("route" to currentRouteDescription()))
+                emitEvent("playback_stopped", mapOf("route" to currentRouteDescription()))
             } catch (t: Throwable) {
-                emitEvent("error:android_flush_failed")
+                emitEvent("error", mapOf("code" to "android_flush_failed"))
             }
         }
     }
@@ -364,6 +564,7 @@ class MindbendGeminiLiveAudioPlugin :
         noiseSuppressor = null
         automaticGainControl?.release()
         automaticGainControl = null
+        captureFirstChunkDelivered = false
 
         if (restoreAudioState) {
             restoreAudioManagerState()
@@ -372,6 +573,8 @@ class MindbendGeminiLiveAudioPlugin :
 
     private fun restoreAudioManagerState() {
         try {
+            unregisterRouteObservers()
+            abandonAudioFocus()
             previousAudioMode?.let { audioManager?.mode = it }
             previousSpeakerphoneOn?.let { audioManager?.isSpeakerphoneOn = it }
         } catch (_: Throwable) {
@@ -409,14 +612,27 @@ class MindbendGeminiLiveAudioPlugin :
     private fun emitCapturedAudio(bytes: ByteArray) {
         val sink = capturedAudioSink ?: return
         mainHandler.post {
+            if (!captureFirstChunkDelivered) {
+                captureFirstChunkDelivered = true
+                emitEvent(
+                    "capture_first_chunk",
+                    mapOf("bytes" to bytes.size, "route" to currentRouteDescription()),
+                )
+            }
             sink.success(bytes)
         }
     }
 
-    private fun emitEvent(value: String) {
+    private fun emitEvent(type: String, details: Map<String, Any?> = emptyMap()) {
         val sink = eventSink ?: return
         mainHandler.post {
-            sink.success(value)
+            val payload = hashMapOf<String, Any?>(
+                "type" to type,
+                "platform" to "android",
+                "atMs" to System.currentTimeMillis(),
+            )
+            payload.putAll(details)
+            sink.success(payload)
         }
     }
 

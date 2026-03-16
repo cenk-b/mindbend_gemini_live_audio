@@ -50,6 +50,6 @@ abstract class MindbendGeminiLiveAudioPlatform extends PlatformInterface {
     'capturedAudio16kStream has not been implemented.',
   );
 
-  Stream<String> get eventStream =>
+  Stream<GeminiLiveAudioEvent> get eventStream =>
       throw UnimplementedError('eventStream has not been implemented.');
 }

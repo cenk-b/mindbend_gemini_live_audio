@@ -45,6 +45,9 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   private var playbackDidStart = false
   private var captureChunkCount = 0
   private var captureSinkMissingLogged = false
+  private var captureFirstBufferLogged = false
+  private var captureFirstChunkDelivered = false
+  private var observersRegistered = false
 
   public static func register(with registrar: FlutterPluginRegistrar) {
     let instance = MindbendGeminiLiveAudioPlugin()
@@ -68,7 +71,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       onListen: { [weak instance] sink in
         instance?.captureEventSink = sink
         instance?.captureSinkMissingLogged = false
-        instance?.emitEvent("debug:ios_capture_sink_attached")
+        instance?.emitEvent("capture_sink_attached")
       },
       onCancel: { [weak instance] in
         instance?.captureEventSink = nil
@@ -77,6 +80,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     let eventHandler = ClosureStreamHandler(
       onListen: { [weak instance] sink in
         instance?.eventSink = sink
+        instance?.emitEvent("event_sink_attached")
       },
       onCancel: { [weak instance] in
         instance?.eventSink = nil
@@ -186,10 +190,12 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       try audioSession.setCategory(
         .playAndRecord,
         mode: .voiceChat,
-        options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker]
+        options: [.allowBluetooth, .defaultToSpeaker]
       )
       try audioSession.setPreferredIOBufferDuration(0.01)
       try audioSession.setActive(true, options: [])
+      applyPreferredOutputRouteLocked(reason: "session_start")
+      registerAudioSessionObserversLocked()
 
       let audioEngine = AVAudioEngine()
       let inputNode = audioEngine.inputNode
@@ -254,10 +260,33 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       isSessionRunning = true
       playbackDidStart = false
       captureChunkCount = 0
+      captureFirstBufferLogged = false
+      captureFirstChunkDelivered = false
       captureSinkMissingLogged = false
       emitEvent(
-        "debug:ios_session_started input_sr=\(Int(inputFormat.sampleRate)) " +
-          "input_ch=\(inputFormat.channelCount) tap=\(requestedTapFrames)"
+        "session_ready",
+        [
+          "inputSampleRateHz": Int(inputFormat.sampleRate),
+          "inputChannels": Int(inputFormat.channelCount),
+          "tapFrames": Int(requestedTapFrames),
+          "captureSampleRateHz": 16_000,
+          "playbackSampleRateHz": 24_000,
+          "route": currentRouteDescriptionLocked(),
+        ]
+      )
+      emitEvent(
+        "capture_ready",
+        [
+          "captureSampleRateHz": 16_000,
+          "route": currentRouteDescriptionLocked(),
+        ]
+      )
+      emitEvent(
+        "playback_ready",
+        [
+          "playbackSampleRateHz": 24_000,
+          "route": currentRouteDescriptionLocked(),
+        ]
       )
 
       return startResult(
@@ -267,7 +296,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       )
     } catch {
       stopSessionLocked(restoreAudioSession: true)
-      emitEvent("error:ios_start_failed")
+      emitEvent("error", ["code": "ios_start_failed"])
       return startResult(
         aecActive: false,
         transportMode: "legacy_half_duplex",
@@ -289,6 +318,197 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     ]
   }
 
+  private func registerAudioSessionObserversLocked() {
+    guard !observersRegistered else { return }
+    let center = NotificationCenter.default
+    center.addObserver(
+      self,
+      selector: #selector(handleAudioSessionInterruption(_:)),
+      name: AVAudioSession.interruptionNotification,
+      object: audioSession
+    )
+    center.addObserver(
+      self,
+      selector: #selector(handleAudioSessionRouteChange(_:)),
+      name: AVAudioSession.routeChangeNotification,
+      object: audioSession
+    )
+    center.addObserver(
+      self,
+      selector: #selector(handleMediaServicesWereLost(_:)),
+      name: AVAudioSession.mediaServicesWereLostNotification,
+      object: audioSession
+    )
+    center.addObserver(
+      self,
+      selector: #selector(handleMediaServicesWereReset(_:)),
+      name: AVAudioSession.mediaServicesWereResetNotification,
+      object: audioSession
+    )
+    observersRegistered = true
+  }
+
+  private func unregisterAudioSessionObserversLocked() {
+    guard observersRegistered else { return }
+    NotificationCenter.default.removeObserver(self, name: AVAudioSession.interruptionNotification, object: audioSession)
+    NotificationCenter.default.removeObserver(self, name: AVAudioSession.routeChangeNotification, object: audioSession)
+    NotificationCenter.default.removeObserver(self, name: AVAudioSession.mediaServicesWereLostNotification, object: audioSession)
+    NotificationCenter.default.removeObserver(self, name: AVAudioSession.mediaServicesWereResetNotification, object: audioSession)
+    observersRegistered = false
+  }
+
+  private func currentRouteDescriptionLocked() -> String {
+    let route = audioSession.currentRoute
+    let inputs = route.inputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
+    let outputs = route.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
+    return "inputs=[\(inputs)] outputs=[\(outputs)]"
+  }
+
+  private func applyPreferredOutputRouteLocked(reason: String) {
+    let outputPortTypes = Set(audioSession.currentRoute.outputs.map(\.portType))
+    let hasExternalRoute = outputPortTypes.contains(.headphones) ||
+      outputPortTypes.contains(.bluetoothA2DP) ||
+      outputPortTypes.contains(.bluetoothHFP) ||
+      outputPortTypes.contains(.bluetoothLE) ||
+      outputPortTypes.contains(.usbAudio) ||
+      outputPortTypes.contains(.carAudio) ||
+      outputPortTypes.contains(.airPlay)
+
+    do {
+      if hasExternalRoute {
+        try audioSession.overrideOutputAudioPort(.none)
+      } else {
+        try audioSession.overrideOutputAudioPort(.speaker)
+      }
+      emitEvent(
+        "route_applied",
+        [
+          "reason": reason,
+          "route": currentRouteDescriptionLocked(),
+          "speakerOverride": !hasExternalRoute,
+        ]
+      )
+    } catch {
+      emitEvent(
+        "error",
+        [
+          "code": "ios_route_apply_failed",
+          "reason": reason,
+          "message": error.localizedDescription,
+        ]
+      )
+    }
+  }
+
+  private func recoverAudioSessionLocked(trigger: String) {
+    guard isSessionRunning else { return }
+    do {
+      try audioSession.setCategory(
+        .playAndRecord,
+        mode: .voiceChat,
+        options: [.allowBluetooth, .defaultToSpeaker]
+      )
+      try audioSession.setPreferredIOBufferDuration(0.01)
+      try audioSession.setActive(true, options: [])
+      applyPreferredOutputRouteLocked(reason: trigger)
+      if let player = playerNode, !player.isPlaying {
+        player.play()
+      }
+      if let audioEngine = engine, !audioEngine.isRunning {
+        audioEngine.prepare()
+        try audioEngine.start()
+      }
+      emitEvent(
+        "session_recovered",
+        [
+          "trigger": trigger,
+          "route": currentRouteDescriptionLocked(),
+        ]
+      )
+    } catch {
+      emitEvent(
+        "error",
+        [
+          "code": "ios_session_recovery_failed",
+          "trigger": trigger,
+          "message": error.localizedDescription,
+        ]
+      )
+    }
+  }
+
+  @objc private func handleAudioSessionInterruption(_ notification: Notification) {
+    sessionQueue.async { [weak self] in
+      guard let self else { return }
+      guard let userInfo = notification.userInfo,
+            let rawType = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+            let type = AVAudioSession.InterruptionType(rawValue: rawType)
+      else {
+        return
+      }
+
+      switch type {
+      case .began:
+        self.emitEvent(
+          "interruption_began",
+          ["route": self.currentRouteDescriptionLocked()]
+        )
+      case .ended:
+        let rawOptions = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+        let options = AVAudioSession.InterruptionOptions(rawValue: rawOptions)
+        self.emitEvent(
+          "interruption_ended",
+          [
+            "shouldResume": options.contains(.shouldResume),
+            "route": self.currentRouteDescriptionLocked(),
+          ]
+        )
+        self.recoverAudioSessionLocked(trigger: "interruption_ended")
+      @unknown default:
+        break
+      }
+    }
+  }
+
+  @objc private func handleAudioSessionRouteChange(_ notification: Notification) {
+    sessionQueue.async { [weak self] in
+      guard let self else { return }
+      let userInfo = notification.userInfo ?? [:]
+      let rawReason = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt ?? 0
+      let reason = AVAudioSession.RouteChangeReason(rawValue: rawReason)
+      let previousRoute = (userInfo[AVAudioSessionRouteChangePreviousRouteKey] as? AVAudioSessionRouteDescription)
+        .map { route in
+          let inputs = route.inputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
+          let outputs = route.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
+          return "inputs=[\(inputs)] outputs=[\(outputs)]"
+        }
+      self.applyPreferredOutputRouteLocked(reason: "route_change")
+      self.emitEvent(
+        "route_changed",
+        [
+          "reason": reason.map { String(describing: $0) } ?? "unknown",
+          "route": self.currentRouteDescriptionLocked(),
+          "previousRoute": previousRoute as Any,
+        ]
+      )
+      self.recoverAudioSessionLocked(trigger: "route_change")
+    }
+  }
+
+  @objc private func handleMediaServicesWereLost(_ notification: Notification) {
+    sessionQueue.async { [weak self] in
+      self?.emitEvent("media_services_lost")
+    }
+  }
+
+  @objc private func handleMediaServicesWereReset(_ notification: Notification) {
+    sessionQueue.async { [weak self] in
+      guard let self else { return }
+      self.emitEvent("media_services_reset")
+      self.recoverAudioSessionLocked(trigger: "media_services_reset")
+    }
+  }
+
   private func handleCapturedBuffer(_ buffer: AVAudioPCMBuffer) {
     guard isSessionRunning,
           let converter = captureConverter,
@@ -297,10 +517,15 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       return
     }
 
-    if captureChunkCount == 0 {
+    if !captureFirstBufferLogged {
+      captureFirstBufferLogged = true
       emitEvent(
-        "debug:ios_capture_buffer_first sr=\(Int(buffer.format.sampleRate)) " +
-          "frames=\(buffer.frameLength)"
+        "capture_buffer_first",
+        [
+          "sampleRateHz": Int(buffer.format.sampleRate),
+          "frames": Int(buffer.frameLength),
+          "route": currentRouteDescriptionLocked(),
+        ]
       )
     }
 
@@ -323,7 +548,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     }
 
     if status == .error || conversionError != nil || converted.frameLength == 0 {
-      emitEvent("error:ios_capture_convert_failed")
+      emitEvent("error", ["code": "ios_capture_convert_failed"])
       return
     }
 
@@ -376,14 +601,20 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     bytes.copyBytes(to: mData.assumingMemoryBound(to: UInt8.self), count: bytes.count)
     audioBufferList[0].mDataByteSize = UInt32(bytes.count)
 
-    if !playbackDidStart {
-      playbackDidStart = true
-      emitEvent("playback_started")
-    }
+    player.scheduleBuffer(pcmBuffer, completionHandler: nil)
     if !player.isPlaying {
       player.play()
     }
-    player.scheduleBuffer(pcmBuffer, completionHandler: nil)
+    if !playbackDidStart {
+      playbackDidStart = true
+      emitEvent(
+        "playback_started",
+        [
+          "bytes": bytes.count,
+          "route": currentRouteDescriptionLocked(),
+        ]
+      )
+    }
   }
 
   private func flushPlaybackLocked() {
@@ -394,8 +625,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     player.reset()
     player.play()
     playbackDidStart = false
-    emitEvent("interrupted")
-    emitEvent("playback_stopped")
+    emitEvent("interrupted", ["route": currentRouteDescriptionLocked()])
+    emitEvent("playback_stopped", ["route": currentRouteDescriptionLocked()])
   }
 
   private func markPlaybackCompleteLocked() {
@@ -419,6 +650,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     engine = nil
     playbackDidStart = false
     isSessionRunning = false
+    captureFirstBufferLogged = false
+    captureFirstChunkDelivered = false
 
     if restoreAudioSession {
       do {
@@ -427,9 +660,11 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         }
         try audioSession.setActive(false, options: [.notifyOthersOnDeactivation])
       } catch {
-        emitEvent("error:ios_restore_session_failed")
+        emitEvent("error", ["code": "ios_restore_session_failed"])
       }
     }
+
+    unregisterAudioSessionObserversLocked()
   }
 
   private func emitCapturedAudio(_ data: Data) {
@@ -441,18 +676,39 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       guard let sink = self.captureEventSink else {
         if !self.captureSinkMissingLogged {
           self.captureSinkMissingLogged = true
-          self.emitEvent("debug:ios_capture_sink_missing")
+          self.emitEvent("capture_sink_missing")
         }
         return
+      }
+      if !self.captureFirstChunkDelivered {
+        self.captureFirstChunkDelivered = true
+        self.emitEvent(
+          "capture_first_chunk",
+          [
+            "bytes": data.count,
+            "chunksDelivered": self.captureChunkCount,
+            "route": self.currentRouteDescriptionLocked(),
+          ]
+        )
       }
       sink(FlutterStandardTypedData(bytes: data))
     }
   }
 
-  private func emitEvent(_ event: String) {
+  private func emitEvent(_ type: String, _ details: [String: Any?] = [:]) {
+    var payload: [String: Any] = [
+      "type": type,
+      "platform": "ios",
+      "atMs": Int(Date().timeIntervalSince1970 * 1000)
+    ]
+    for (key, value) in details {
+      if let value {
+        payload[key] = value
+      }
+    }
     DispatchQueue.main.async { [weak self] in
       guard let self, let sink = self.eventSink else { return }
-      sink(event)
+      sink(payload)
     }
   }
 }

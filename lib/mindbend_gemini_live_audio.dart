@@ -64,6 +64,83 @@ class GeminiLiveAudioStartResult {
   };
 }
 
+class GeminiLiveAudioEvent {
+  const GeminiLiveAudioEvent({
+    required this.type,
+    required this.platform,
+    required this.data,
+    this.atMs,
+  });
+
+  final String type;
+  final String platform;
+  final int? atMs;
+  final Map<String, Object?> data;
+
+  bool get isError => type == 'error';
+
+  String? get code {
+    final value = data['code'];
+    if (value is String && value.trim().isNotEmpty) {
+      return value.trim();
+    }
+    return null;
+  }
+
+  factory GeminiLiveAudioEvent.fromRaw(Object? raw) {
+    if (raw is Map) {
+      final normalized = raw.map(
+        (key, value) => MapEntry(key.toString(), value),
+      );
+      final typeValue = normalized['type'];
+      final platformValue = normalized['platform'];
+      final atMsValue = normalized['atMs'];
+      final payload = Map<String, Object?>.from(normalized)
+        ..remove('type')
+        ..remove('platform')
+        ..remove('atMs');
+      return GeminiLiveAudioEvent(
+        type: typeValue is String && typeValue.trim().isNotEmpty
+            ? typeValue.trim()
+            : 'unknown',
+        platform: platformValue is String && platformValue.trim().isNotEmpty
+            ? platformValue.trim()
+            : 'unknown',
+        atMs: atMsValue is int
+            ? atMsValue
+            : (atMsValue is num ? atMsValue.toInt() : null),
+        data: payload,
+      );
+    }
+
+    final normalized = raw?.toString().trim() ?? '';
+    if (normalized.isEmpty) {
+      return const GeminiLiveAudioEvent(
+        type: 'unknown',
+        platform: 'unknown',
+        data: <String, Object?>{},
+      );
+    }
+
+    if (normalized.startsWith('error:')) {
+      return GeminiLiveAudioEvent(
+        type: 'error',
+        platform: 'unknown',
+        data: <String, Object?>{
+          'code': normalized.substring('error:'.length),
+          'legacyEvent': normalized,
+        },
+      );
+    }
+
+    return GeminiLiveAudioEvent(
+      type: normalized,
+      platform: 'unknown',
+      data: <String, Object?>{'legacyEvent': normalized},
+    );
+  }
+}
+
 class GeminiLiveAudioDebugOptions {
   const GeminiLiveAudioDebugOptions({
     this.disableNoiseSuppressor = false,
@@ -109,6 +186,6 @@ class MindbendGeminiLiveAudio {
   Stream<Uint8List> get capturedAudio16kStream =>
       MindbendGeminiLiveAudioPlatform.instance.capturedAudio16kStream;
 
-  Stream<String> get eventStream =>
+  Stream<GeminiLiveAudioEvent> get eventStream =>
       MindbendGeminiLiveAudioPlatform.instance.eventStream;
 }

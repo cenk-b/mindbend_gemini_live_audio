@@ -23,7 +23,7 @@ class MethodChannelMindbendGeminiLiveAudio
   );
 
   Stream<Uint8List>? _capturedAudio16kStream;
-  Stream<String>? _eventStream;
+  Stream<GeminiLiveAudioEvent>? _eventStream;
 
   @override
   Future<GeminiLiveAudioStartResult> startSession() async {
@@ -94,11 +94,11 @@ class MethodChannelMindbendGeminiLiveAudio
   }
 
   @override
-  Stream<String> get eventStream {
+  Stream<GeminiLiveAudioEvent> get eventStream {
     _eventStream ??= eventChannel
         .receiveBroadcastStream()
-        .map((Object? event) => event?.toString() ?? '')
-        .where((event) => event.isNotEmpty)
+        .map(GeminiLiveAudioEvent.fromRaw)
+        .where((event) => event.type.trim().isNotEmpty)
         .asBroadcastStream();
     return _eventStream!;
   }
