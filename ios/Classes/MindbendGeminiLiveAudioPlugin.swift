@@ -194,7 +194,6 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       )
       try audioSession.setPreferredIOBufferDuration(0.01)
       try audioSession.setActive(true, options: [])
-      applyPreferredOutputRouteLocked(reason: "session_start")
       registerAudioSessionObserversLocked()
 
       let audioEngine = AVAudioEngine()
@@ -263,6 +262,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       captureFirstBufferLogged = false
       captureFirstChunkDelivered = false
       captureSinkMissingLogged = false
+      emitCurrentRouteEventLocked(type: "route_applied", reason: "session_start")
       emitEvent(
         "session_ready",
         [
@@ -364,35 +364,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     return "inputs=[\(inputs)] outputs=[\(outputs)]"
   }
 
-  private func preferredVoiceInputLocked(forceBuiltInMic: Bool) -> AVAudioSessionPortDescription? {
-    let availableInputs = audioSession.availableInputs ?? []
-    guard !availableInputs.isEmpty else {
-      return nil
-    }
-
-    if forceBuiltInMic {
-      return availableInputs.first(where: { $0.portType == .builtInMic }) ??
-        availableInputs.first(where: { $0.portType == .headsetMic }) ??
-        availableInputs.first
-    }
-
-    if let currentInput = audioSession.currentRoute.inputs.first,
-       let currentMatch = availableInputs.first(where: { $0.uid == currentInput.uid }) {
-      return currentMatch
-    }
-
-    return availableInputs.first(where: { $0.portType == .bluetoothHFP }) ??
-      availableInputs.first(where: { $0.portType == .bluetoothLE }) ??
-      availableInputs.first(where: { $0.portType == .headsetMic }) ??
-      availableInputs.first(where: { $0.portType == .builtInMic }) ??
-      availableInputs.first
-  }
-
-  private func routeSupportDetailsLocked(
-    reason: String,
-    preferredInput: AVAudioSessionPortDescription?,
-    forceLocalDuplex: Bool
-  ) -> [String: Any?] {
+  private func routeSupportDetailsLocked(reason: String) -> [String: Any?] {
     let route = audioSession.currentRoute
     let inputs = route.inputs.map(\.portType.rawValue)
     let outputs = route.outputs.map(\.portType.rawValue)
@@ -407,14 +379,6 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       "inputs": inputs,
       "outputs": outputs,
       "unsupportedOutputs": unsupportedOutputs,
-      "preferredInput": preferredInput?.portType.rawValue,
-      "forceLocalDuplex": forceLocalDuplex,
-      "speakerOverride": forceLocalDuplex || !route.outputs.contains(where: {
-        $0.portType == .headphones ||
-          $0.portType == .bluetoothHFP ||
-          $0.portType == .bluetoothLE ||
-          $0.portType == .usbAudio
-      }),
     ]
   }
 
@@ -423,55 +387,16 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     return outputPortTypes.contains(.bluetoothA2DP) || outputPortTypes.contains(.airPlay)
   }
 
-  private func applyPreferredOutputRouteLocked(reason: String) {
-    let outputPortTypes = Set(audioSession.currentRoute.outputs.map(\.portType))
-    let hasExternalRoute = outputPortTypes.contains(.headphones) ||
-      outputPortTypes.contains(.bluetoothA2DP) ||
-      outputPortTypes.contains(.bluetoothHFP) ||
-      outputPortTypes.contains(.bluetoothLE) ||
-      outputPortTypes.contains(.usbAudio) ||
-      outputPortTypes.contains(.carAudio) ||
-      outputPortTypes.contains(.airPlay)
-    let forceLocalDuplex = outputPortTypes.contains(.bluetoothA2DP) ||
-      outputPortTypes.contains(.airPlay)
-    let preferredInput = preferredVoiceInputLocked(forceBuiltInMic: forceLocalDuplex)
-
-    do {
-      try audioSession.setPreferredInput(preferredInput)
-      if hasExternalRoute && !forceLocalDuplex {
-        try audioSession.overrideOutputAudioPort(.none)
-      } else {
-        try audioSession.overrideOutputAudioPort(.speaker)
-      }
-      emitEvent(
-        "route_applied",
-        [
-          "reason": reason,
-          "route": currentRouteDescriptionLocked(),
-          "speakerOverride": !hasExternalRoute || forceLocalDuplex,
-          "preferredInput": preferredInput?.portType.rawValue as Any,
-          "forceLocalDuplex": forceLocalDuplex,
-        ]
-      )
-      if isUnsupportedNativeVoiceRouteLocked() {
-        emitEvent(
-          "route_unsupported",
-          routeSupportDetailsLocked(
-            reason: reason,
-            preferredInput: preferredInput,
-            forceLocalDuplex: forceLocalDuplex
-          )
-        )
-      }
-    } catch {
-      emitEvent(
-        "error",
-        [
-          "code": "ios_route_apply_failed",
-          "reason": reason,
-          "message": error.localizedDescription,
-        ]
-      )
+  private func emitCurrentRouteEventLocked(type: String, reason: String) {
+    emitEvent(
+      type,
+      [
+        "reason": reason,
+        "route": currentRouteDescriptionLocked(),
+      ]
+    )
+    if isUnsupportedNativeVoiceRouteLocked() {
+      emitEvent("route_unsupported", routeSupportDetailsLocked(reason: reason))
     }
   }
 
@@ -485,7 +410,6 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       )
       try audioSession.setPreferredIOBufferDuration(0.01)
       try audioSession.setActive(true, options: [])
-      applyPreferredOutputRouteLocked(reason: trigger)
       if let player = playerNode, !player.isPlaying {
         player.play()
       }
@@ -493,13 +417,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         audioEngine.prepare()
         try audioEngine.start()
       }
-      emitEvent(
-        "session_recovered",
-        [
-          "trigger": trigger,
-          "route": currentRouteDescriptionLocked(),
-        ]
-      )
+      emitCurrentRouteEventLocked(type: "route_applied", reason: trigger)
+      emitEvent("session_recovered", ["trigger": trigger, "route": currentRouteDescriptionLocked()])
     } catch {
       emitEvent(
         "error",
@@ -557,7 +476,6 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
           let outputs = route.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
           return "inputs=[\(inputs)] outputs=[\(outputs)]"
         }
-      self.applyPreferredOutputRouteLocked(reason: "route_change")
       self.emitEvent(
         "route_changed",
         [
@@ -568,14 +486,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         ]
       )
       if self.isUnsupportedNativeVoiceRouteLocked() {
-        self.emitEvent(
-          "route_unsupported",
-          self.routeSupportDetailsLocked(
-            reason: "route_change",
-            preferredInput: self.preferredVoiceInputLocked(forceBuiltInMic: true),
-            forceLocalDuplex: true
-          )
-        )
+        self.emitEvent("route_unsupported", self.routeSupportDetailsLocked(reason: "route_change"))
       }
     }
   }
