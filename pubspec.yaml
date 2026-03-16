@@ -1,6 +1,6 @@
 name: mindbend_gemini_live_audio
 description: "Native Gemini Live full-duplex audio transport with hardware AEC."
-version: 0.0.1
+version: 0.0.3
 homepage: https://github.com/cenk-b/mindbend_gemini_live_audio
 
 environment:
