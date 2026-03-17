@@ -509,6 +509,52 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     ]
   }
 
+  private func pcm16StatsLocked(_ data: Data, maxSamples: Int = 4096) -> [String: Any?] {
+    let availableSamples = data.count / MemoryLayout<Int16>.size
+    let sampleCount = min(availableSamples, maxSamples)
+    guard sampleCount > 0 else {
+      return [:]
+    }
+
+    var nonZeroCount = 0
+    var peak = 0
+    var sumSquares = 0.0
+
+    data.withUnsafeBytes { rawBuffer in
+      guard let base = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
+        return
+      }
+      for index in 0..<sampleCount {
+        let offset = index * 2
+        let magnitudeSource = Int16(
+          bitPattern: UInt16(base[offset]) | (UInt16(base[offset + 1]) << 8)
+        )
+        let magnitude = magnitudeSource == Int16.min
+          ? 32767
+          : abs(Int(magnitudeSource))
+        if magnitude > 0 {
+          nonZeroCount += 1
+        }
+        if magnitude > peak {
+          peak = magnitude
+        }
+        sumSquares += Double(magnitude * magnitude)
+      }
+    }
+
+    let rms = sqrt(sumSquares / Double(sampleCount))
+    let rmsNormalized = rms / 32767.0
+    let peakNormalized = Double(peak) / 32767.0
+
+    return [
+      "sampleCount": sampleCount,
+      "nonZeroRatio": Double((Double(nonZeroCount) / Double(sampleCount) * 1000).rounded()) / 1000,
+      "rmsNormalized": Double((rmsNormalized * 10000).rounded()) / 10000,
+      "peakNormalized": Double((peakNormalized * 10000).rounded()) / 10000,
+      "rmsDbfs": Double((20.0 * log10(max(rmsNormalized, 0.000001)) * 10).rounded()) / 10,
+    ]
+  }
+
   private func schedulePlaybackProbesLocked() {
     cancelPlaybackProbesLocked()
     let probes: [(TimeInterval, String)] = [
@@ -848,6 +894,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       playbackChunkCount == 1 ||
       playbackChunkCount <= 4 ||
       playbackChunkCount % 16 == 0
+    let pcmStats = shouldEmitEnqueueSnapshot ? pcm16StatsLocked(bytes) : [:]
     player.scheduleBuffer(pcmBuffer) { [weak self] in
       guard let self else { return }
       self.sessionQueue.async {
@@ -868,14 +915,18 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       player.play()
     }
     if shouldEmitEnqueueSnapshot {
+      var details: [String: Any?] = [
+        "bytes": bytes.count,
+        "chunkCount": playbackChunkCount,
+        "playbackBytesScheduled": playbackBytesScheduled,
+        "pendingPlaybackBufferCount": pendingPlaybackBufferCount,
+      ]
+      for (key, value) in pcmStats {
+        details[key] = value
+      }
       emitSessionSnapshotLocked(
         "playback_chunk_enqueued",
-        [
-          "bytes": bytes.count,
-          "chunkCount": playbackChunkCount,
-          "playbackBytesScheduled": playbackBytesScheduled,
-          "pendingPlaybackBufferCount": pendingPlaybackBufferCount,
-        ]
+        details
       )
     }
     if !playbackDidStart {
