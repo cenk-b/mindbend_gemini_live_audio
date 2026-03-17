@@ -44,6 +44,10 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   private var isSessionRunning = false
   private var playbackDidStart = false
   private var captureChunkCount = 0
+  private var playbackChunkCount = 0
+  private var playbackBytesScheduled = 0
+  private var playbackCompletionCount = 0
+  private var pendingPlaybackBufferCount = 0
   private var captureSinkMissingLogged = false
   private var captureFirstBufferLogged = false
   private var captureFirstChunkDelivered = false
@@ -266,6 +270,10 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       isSessionRunning = true
       playbackDidStart = false
       captureChunkCount = 0
+      playbackChunkCount = 0
+      playbackBytesScheduled = 0
+      playbackCompletionCount = 0
+      pendingPlaybackBufferCount = 0
       captureFirstBufferLogged = false
       captureFirstChunkDelivered = false
       captureSinkMissingLogged = false
@@ -393,6 +401,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       "audioSessionIoBufferMs": Int((audioSession.ioBufferDuration * 1000).rounded()),
       "audioSessionInputLatencyMs": Int((audioSession.inputLatency * 1000).rounded()),
       "audioSessionOutputLatencyMs": Int((audioSession.outputLatency * 1000).rounded()),
+      "audioSessionOutputVolume": audioSession.outputVolume,
       "inputAvailable": audioSession.isInputAvailable,
       "preferredInput": audioSession.preferredInput.map {
         "\($0.portType.rawValue):\($0.portName)"
@@ -405,6 +414,10 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       "captureFirstBufferLogged": captureFirstBufferLogged,
       "captureFirstChunkDelivered": captureFirstChunkDelivered,
       "captureChunkCount": captureChunkCount,
+      "playbackChunkCount": playbackChunkCount,
+      "playbackBytesScheduled": playbackBytesScheduled,
+      "playbackCompletionCount": playbackCompletionCount,
+      "pendingPlaybackBufferCount": pendingPlaybackBufferCount,
       "sessionStartedAtMs": sessionStartedAtMs as Any,
       "snapshotAtMs": nowMs,
       "elapsedSinceStartMs": sessionStartedAtMs.map { max(0, nowMs - $0) } as Any,
@@ -775,9 +788,42 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     bytes.copyBytes(to: mData.assumingMemoryBound(to: UInt8.self), count: bytes.count)
     audioBufferList[0].mDataByteSize = UInt32(bytes.count)
 
-    player.scheduleBuffer(pcmBuffer, completionHandler: nil)
+    playbackChunkCount += 1
+    playbackBytesScheduled += bytes.count
+    pendingPlaybackBufferCount += 1
+    let shouldEmitEnqueueSnapshot =
+      playbackChunkCount == 1 ||
+      playbackChunkCount <= 4 ||
+      playbackChunkCount % 16 == 0
+    player.scheduleBuffer(pcmBuffer) { [weak self] in
+      guard let self else { return }
+      self.sessionQueue.async {
+        self.pendingPlaybackBufferCount = max(0, self.pendingPlaybackBufferCount - 1)
+        self.playbackCompletionCount += 1
+        if self.playbackCompletionCount == 1 || self.playbackCompletionCount % 16 == 0 {
+          self.emitSessionSnapshotLocked(
+            "playback_chunk_completed",
+            [
+              "completionCount": self.playbackCompletionCount,
+              "pendingPlaybackBufferCount": self.pendingPlaybackBufferCount,
+            ]
+          )
+        }
+      }
+    }
     if !player.isPlaying {
       player.play()
+    }
+    if shouldEmitEnqueueSnapshot {
+      emitSessionSnapshotLocked(
+        "playback_chunk_enqueued",
+        [
+          "bytes": bytes.count,
+          "chunkCount": playbackChunkCount,
+          "playbackBytesScheduled": playbackBytesScheduled,
+          "pendingPlaybackBufferCount": pendingPlaybackBufferCount,
+        ]
+      )
     }
     if !playbackDidStart {
       playbackDidStart = true
@@ -799,6 +845,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     player.reset()
     player.play()
     playbackDidStart = false
+    pendingPlaybackBufferCount = 0
     emitEvent("interrupted", ["route": currentRouteDescriptionLocked()])
     emitEvent("playback_stopped", ["route": currentRouteDescriptionLocked()])
   }
@@ -823,6 +870,10 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     playbackFormat = nil
     engine = nil
     playbackDidStart = false
+    playbackChunkCount = 0
+    playbackBytesScheduled = 0
+    playbackCompletionCount = 0
+    pendingPlaybackBufferCount = 0
     isSessionRunning = false
     captureFirstBufferLogged = false
     captureFirstChunkDelivered = false
