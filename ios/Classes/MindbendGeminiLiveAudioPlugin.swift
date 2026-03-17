@@ -56,6 +56,9 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   private var lastMixerBufferAtMs: Int?
   private var playbackStartupConfirmed = false
   private var playbackStartupRecoveryAttempted = false
+  private var startupPlaybackReplayBuffers: [Data] = []
+  private var startupPlaybackReplayBytes = 0
+  private var isReplayingStartupBuffers = false
   private var captureSinkMissingLogged = false
   private var captureFirstBufferLogged = false
   private var captureFirstChunkDelivered = false
@@ -63,6 +66,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   private var captureStallProbeWorkItems: [DispatchWorkItem] = []
   private var playbackProbeWorkItems: [DispatchWorkItem] = []
   private var sessionStartedAtMs: Int?
+  private let startupPlaybackReplayMaxBytes = 240_000
 
   public static func register(with registrar: FlutterPluginRegistrar) {
     let instance = MindbendGeminiLiveAudioPlugin()
@@ -299,6 +303,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       lastMixerBufferAtMs = nil
       playbackStartupConfirmed = false
       playbackStartupRecoveryAttempted = false
+      clearStartupPlaybackReplayLocked()
+      isReplayingStartupBuffers = false
       captureFirstBufferLogged = false
       captureFirstChunkDelivered = false
       captureSinkMissingLogged = false
@@ -662,6 +668,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       let rmsNormalized = (stats["rmsNormalized"] as? Double) ?? 0
       if nonZeroRatio > 0.05 || rmsNormalized > 0.002 {
         playbackStartupConfirmed = true
+        clearStartupPlaybackReplayLocked()
         emitSessionSnapshotLocked(
           "playback_startup_confirmed",
           [
@@ -686,6 +693,47 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         "playback_mixer_buffer_first",
         details
       )
+    }
+  }
+
+  private func clearStartupPlaybackReplayLocked() {
+    startupPlaybackReplayBuffers.removeAll(keepingCapacity: false)
+    startupPlaybackReplayBytes = 0
+  }
+
+  private func cacheStartupPlaybackBufferLocked(_ bytes: Data) {
+    guard !playbackStartupConfirmed else { return }
+    guard !isReplayingStartupBuffers else { return }
+    guard !bytes.isEmpty else { return }
+
+    startupPlaybackReplayBuffers.append(bytes)
+    startupPlaybackReplayBytes += bytes.count
+
+    while startupPlaybackReplayBytes > startupPlaybackReplayMaxBytes &&
+      !startupPlaybackReplayBuffers.isEmpty {
+      startupPlaybackReplayBytes -= startupPlaybackReplayBuffers.removeFirst().count
+    }
+  }
+
+  private func replayStartupPlaybackBuffersLocked(reason: String) {
+    guard !startupPlaybackReplayBuffers.isEmpty else { return }
+    let replayBuffers = startupPlaybackReplayBuffers
+    let replayBytes = startupPlaybackReplayBytes
+    clearStartupPlaybackReplayLocked()
+    isReplayingStartupBuffers = true
+    defer { isReplayingStartupBuffers = false }
+
+    emitSessionSnapshotLocked(
+      "playback_startup_replay",
+      [
+        "reason": reason,
+        "replayBufferCount": replayBuffers.count,
+        "replayBytes": replayBytes,
+      ]
+    )
+
+    for buffer in replayBuffers {
+      try? pushPlaybackLocked(bytes: buffer)
     }
   }
 
@@ -1060,6 +1108,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     playbackChunkCount += 1
     playbackBytesScheduled += bytes.count
     pendingPlaybackBufferCount += 1
+    cacheStartupPlaybackBufferLocked(bytes)
     let shouldEmitEnqueueSnapshot =
       playbackChunkCount == 1 ||
       playbackChunkCount <= 4 ||
@@ -1147,6 +1196,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     playbackStartupConfirmed = false
     cancelPlaybackProbesLocked()
     if emitInterruption {
+      clearStartupPlaybackReplayLocked()
       emitEvent("interrupted", ["route": currentRouteDescriptionLocked()])
       emitEvent("playback_stopped", ["route": currentRouteDescriptionLocked()])
     } else {
@@ -1156,6 +1206,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
           "reason": reason,
         ]
       )
+      replayStartupPlaybackBuffersLocked(reason: reason)
     }
   }
 
@@ -1190,6 +1241,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     lastMixerRmsNormalized = nil
     lastMixerPeakNormalized = nil
     lastMixerBufferAtMs = nil
+    clearStartupPlaybackReplayLocked()
+    isReplayingStartupBuffers = false
     isSessionRunning = false
     captureFirstBufferLogged = false
     captureFirstChunkDelivered = false
