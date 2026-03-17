@@ -656,14 +656,17 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
 
     if !mixerFirstBufferLogged {
       mixerFirstBufferLogged = true
+      var details: [String: Any?] = [
+        "mixerBufferCount": mixerBufferCount,
+        "mixerSampleRateHz": Int(buffer.format.sampleRate.rounded()),
+        "mixerChannels": Int(buffer.format.channelCount),
+      ]
+      for (key, value) in stats {
+        details[key] = value
+      }
       emitSessionSnapshotLocked(
         "playback_mixer_buffer_first",
-        [
-          "mixerBufferCount": mixerBufferCount,
-          "mixerSampleRateHz": Int(buffer.format.sampleRate.rounded()),
-          "mixerChannels": Int(buffer.format.channelCount),
-          ...stats,
-        ]
+        details
       )
     }
   }
