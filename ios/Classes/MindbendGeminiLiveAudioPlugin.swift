@@ -48,6 +48,12 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   private var playbackBytesScheduled = 0
   private var playbackCompletionCount = 0
   private var pendingPlaybackBufferCount = 0
+  private var mixerBufferCount = 0
+  private var mixerFirstBufferLogged = false
+  private var lastMixerNonZeroRatio: Double?
+  private var lastMixerRmsNormalized: Double?
+  private var lastMixerPeakNormalized: Double?
+  private var lastMixerBufferAtMs: Int?
   private var captureSinkMissingLogged = false
   private var captureFirstBufferLogged = false
   private var captureFirstChunkDelivered = false
@@ -244,6 +250,14 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       audioEngine.attach(player)
       audioEngine.connect(player, to: audioEngine.mainMixerNode, format: outputPlaybackFormat)
       audioEngine.mainMixerNode.outputVolume = 1.0
+      let mixerFormat = audioEngine.mainMixerNode.outputFormat(forBus: 0)
+      audioEngine.mainMixerNode.installTap(
+        onBus: 0,
+        bufferSize: 1024,
+        format: mixerFormat
+      ) { [weak self] buffer, _ in
+        self?.handleMixerBuffer(buffer)
+      }
 
       // Request ~30ms input buffers at the hardware sample rate (typically 48kHz).
       // AVAudioEngine treats this as a hint and may deliver larger chunks.
@@ -275,6 +289,12 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       playbackBytesScheduled = 0
       playbackCompletionCount = 0
       pendingPlaybackBufferCount = 0
+      mixerBufferCount = 0
+      mixerFirstBufferLogged = false
+      lastMixerNonZeroRatio = nil
+      lastMixerRmsNormalized = nil
+      lastMixerPeakNormalized = nil
+      lastMixerBufferAtMs = nil
       captureFirstBufferLogged = false
       captureFirstChunkDelivered = false
       captureSinkMissingLogged = false
@@ -419,6 +439,12 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       "playbackBytesScheduled": playbackBytesScheduled,
       "playbackCompletionCount": playbackCompletionCount,
       "pendingPlaybackBufferCount": pendingPlaybackBufferCount,
+      "mixerBufferCount": mixerBufferCount,
+      "mixerFirstBufferLogged": mixerFirstBufferLogged,
+      "lastMixerNonZeroRatio": lastMixerNonZeroRatio as Any,
+      "lastMixerRmsNormalized": lastMixerRmsNormalized as Any,
+      "lastMixerPeakNormalized": lastMixerPeakNormalized as Any,
+      "lastMixerBufferAtMs": lastMixerBufferAtMs as Any,
       "sessionStartedAtMs": sessionStartedAtMs as Any,
       "snapshotAtMs": nowMs,
       "elapsedSinceStartMs": sessionStartedAtMs.map { max(0, nowMs - $0) } as Any,
@@ -553,6 +579,93 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       "peakNormalized": Double((peakNormalized * 10000).rounded()) / 10000,
       "rmsDbfs": Double((20.0 * log10(max(rmsNormalized, 0.000001)) * 10).rounded()) / 10,
     ]
+  }
+
+  private func pcmBufferStatsLocked(
+    _ buffer: AVAudioPCMBuffer,
+    maxSamples: Int = 4096
+  ) -> [String: Any?] {
+    let sampleCount = min(Int(buffer.frameLength), maxSamples)
+    guard sampleCount > 0 else {
+      return [:]
+    }
+
+    var nonZeroCount = 0
+    var peak = 0.0
+    var sumSquares = 0.0
+
+    switch buffer.format.commonFormat {
+    case .pcmFormatFloat32:
+      guard let channels = buffer.floatChannelData else { return [:] }
+      let channel = channels[0]
+      for index in 0..<sampleCount {
+        let value = Double(abs(channel[index]))
+        if value > 0.0001 {
+          nonZeroCount += 1
+        }
+        if value > peak {
+          peak = value
+        }
+        sumSquares += value * value
+      }
+    case .pcmFormatInt16:
+      guard let channels = buffer.int16ChannelData else { return [:] }
+      let channel = channels[0]
+      for index in 0..<sampleCount {
+        let raw = channel[index]
+        let magnitude = Double(raw == Int16.min ? 32767 : abs(Int(raw))) / 32767.0
+        if magnitude > 0.0001 {
+          nonZeroCount += 1
+        }
+        if magnitude > peak {
+          peak = magnitude
+        }
+        sumSquares += magnitude * magnitude
+      }
+    default:
+      return [:]
+    }
+
+    let rms = sqrt(sumSquares / Double(sampleCount))
+    return [
+      "sampleCount": sampleCount,
+      "nonZeroRatio": Double((Double(nonZeroCount) / Double(sampleCount) * 1000).rounded()) / 1000,
+      "rmsNormalized": Double((rms * 10000).rounded()) / 10000,
+      "peakNormalized": Double((peak * 10000).rounded()) / 10000,
+      "rmsDbfs": Double((20.0 * log10(max(rms, 0.000001)) * 10).rounded()) / 10,
+    ]
+  }
+
+  private func handleMixerBuffer(_ buffer: AVAudioPCMBuffer) {
+    guard isSessionRunning, playbackDidStart else { return }
+
+    let stats = pcmBufferStatsLocked(buffer)
+    guard !stats.isEmpty else { return }
+
+    mixerBufferCount += 1
+    lastMixerBufferAtMs = Int(Date().timeIntervalSince1970 * 1000)
+    if let value = stats["nonZeroRatio"] as? Double {
+      lastMixerNonZeroRatio = value
+    }
+    if let value = stats["rmsNormalized"] as? Double {
+      lastMixerRmsNormalized = value
+    }
+    if let value = stats["peakNormalized"] as? Double {
+      lastMixerPeakNormalized = value
+    }
+
+    if !mixerFirstBufferLogged {
+      mixerFirstBufferLogged = true
+      emitSessionSnapshotLocked(
+        "playback_mixer_buffer_first",
+        [
+          "mixerBufferCount": mixerBufferCount,
+          "mixerSampleRateHz": Int(buffer.format.sampleRate.rounded()),
+          "mixerChannels": Int(buffer.format.channelCount),
+          ...stats,
+        ]
+      )
+    }
   }
 
   private func schedulePlaybackProbesLocked() {
@@ -951,6 +1064,12 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     player.play()
     playbackDidStart = false
     pendingPlaybackBufferCount = 0
+    mixerBufferCount = 0
+    mixerFirstBufferLogged = false
+    lastMixerNonZeroRatio = nil
+    lastMixerRmsNormalized = nil
+    lastMixerPeakNormalized = nil
+    lastMixerBufferAtMs = nil
     cancelPlaybackProbesLocked()
     emitEvent("interrupted", ["route": currentRouteDescriptionLocked()])
     emitEvent("playback_stopped", ["route": currentRouteDescriptionLocked()])
@@ -965,6 +1084,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     if let inputNode = engine?.inputNode {
       inputNode.removeTap(onBus: 0)
     }
+    engine?.mainMixerNode.removeTap(onBus: 0)
     playerNode?.stop()
     playerNode?.reset()
     engine?.stop()
@@ -980,6 +1100,12 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     playbackBytesScheduled = 0
     playbackCompletionCount = 0
     pendingPlaybackBufferCount = 0
+    mixerBufferCount = 0
+    mixerFirstBufferLogged = false
+    lastMixerNonZeroRatio = nil
+    lastMixerRmsNormalized = nil
+    lastMixerPeakNormalized = nil
+    lastMixerBufferAtMs = nil
     isSessionRunning = false
     captureFirstBufferLogged = false
     captureFirstChunkDelivered = false
