@@ -48,6 +48,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   private var captureFirstBufferLogged = false
   private var captureFirstChunkDelivered = false
   private var observersRegistered = false
+  private var captureStallProbeWorkItems: [DispatchWorkItem] = []
+  private var sessionStartedAtMs: Int?
 
   public static func register(with registrar: FlutterPluginRegistrar) {
     let instance = MindbendGeminiLiveAudioPlugin()
@@ -257,13 +259,15 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       captureTargetFormat = targetCaptureFormat
       playbackFormat = outputPlaybackFormat
       isSessionRunning = true
+      sessionStartedAtMs = Int(Date().timeIntervalSince1970 * 1000)
       playbackDidStart = false
       captureChunkCount = 0
       captureFirstBufferLogged = false
       captureFirstChunkDelivered = false
       captureSinkMissingLogged = false
+      scheduleCaptureStallProbesLocked()
       emitCurrentRouteEventLocked(type: "route_applied", reason: "session_start")
-      emitEvent(
+      emitSessionSnapshotLocked(
         "session_ready",
         [
           "inputSampleRateHz": Int(inputFormat.sampleRate),
@@ -274,14 +278,14 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
           "route": currentRouteDescriptionLocked(),
         ]
       )
-      emitEvent(
+      emitSessionSnapshotLocked(
         "capture_ready",
         [
           "captureSampleRateHz": 16_000,
           "route": currentRouteDescriptionLocked(),
         ]
       )
-      emitEvent(
+      emitSessionSnapshotLocked(
         "playback_ready",
         [
           "playbackSampleRateHz": 24_000,
@@ -364,6 +368,97 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     return "inputs=[\(inputs)] outputs=[\(outputs)]"
   }
 
+  private func sessionSnapshotLocked() -> [String: Any?] {
+    let availableInputs = (audioSession.availableInputs ?? []).map {
+      "\($0.portType.rawValue):\($0.portName)"
+    }
+    let currentInput = audioSession.currentRoute.inputs.first.map {
+      "\($0.portType.rawValue):\($0.portName)"
+    }
+    let inputNode = engine?.inputNode
+    let inputNodeOutputFormat = inputNode?.outputFormat(forBus: 0)
+    let inputNodeInputFormat = inputNode?.inputFormat(forBus: 0)
+    let nowMs = Int(Date().timeIntervalSince1970 * 1000)
+
+    return [
+      "route": currentRouteDescriptionLocked(),
+      "audioSessionCategory": audioSession.category.rawValue,
+      "audioSessionMode": audioSession.mode.rawValue,
+      "audioSessionSampleRateHz": Int(audioSession.sampleRate.rounded()),
+      "audioSessionIoBufferMs": Int((audioSession.ioBufferDuration * 1000).rounded()),
+      "audioSessionInputLatencyMs": Int((audioSession.inputLatency * 1000).rounded()),
+      "audioSessionOutputLatencyMs": Int((audioSession.outputLatency * 1000).rounded()),
+      "inputAvailable": audioSession.isInputAvailable,
+      "preferredInput": audioSession.preferredInput.map {
+        "\($0.portType.rawValue):\($0.portName)"
+      },
+      "currentInput": currentInput,
+      "availableInputs": availableInputs,
+      "engineRunning": engine?.isRunning ?? false,
+      "playerPlaying": playerNode?.isPlaying ?? false,
+      "playbackDidStart": playbackDidStart,
+      "captureFirstBufferLogged": captureFirstBufferLogged,
+      "captureFirstChunkDelivered": captureFirstChunkDelivered,
+      "captureChunkCount": captureChunkCount,
+      "sessionStartedAtMs": sessionStartedAtMs as Any,
+      "snapshotAtMs": nowMs,
+      "elapsedSinceStartMs": sessionStartedAtMs.map { max(0, nowMs - $0) } as Any,
+      "inputNodeOutputSampleRateHz": inputNodeOutputFormat.map {
+        Int($0.sampleRate.rounded())
+      } as Any,
+      "inputNodeOutputChannels": inputNodeOutputFormat.map {
+        Int($0.channelCount)
+      } as Any,
+      "inputNodeInputSampleRateHz": inputNodeInputFormat.map {
+        Int($0.sampleRate.rounded())
+      } as Any,
+      "inputNodeInputChannels": inputNodeInputFormat.map {
+        Int($0.channelCount)
+      } as Any,
+    ]
+  }
+
+  private func emitSessionSnapshotLocked(
+    _ type: String,
+    _ details: [String: Any?] = [:]
+  ) {
+    var payload = sessionSnapshotLocked()
+    for (key, value) in details {
+      payload[key] = value
+    }
+    emitEvent(type, payload)
+  }
+
+  private func cancelCaptureStallProbesLocked() {
+    for workItem in captureStallProbeWorkItems {
+      workItem.cancel()
+    }
+    captureStallProbeWorkItems.removeAll()
+  }
+
+  private func scheduleCaptureStallProbesLocked() {
+    cancelCaptureStallProbesLocked()
+    let probes: [(TimeInterval, String)] = [
+      (0.35, "350ms"),
+      (1.0, "1000ms"),
+      (2.2, "2200ms"),
+    ]
+    for (delay, label) in probes {
+      let workItem = DispatchWorkItem { [weak self] in
+        guard let self else { return }
+        guard self.isSessionRunning, !self.captureFirstBufferLogged else { return }
+        self.emitSessionSnapshotLocked(
+          "capture_stall_probe",
+          [
+            "probeLabel": label,
+          ]
+        )
+      }
+      captureStallProbeWorkItems.append(workItem)
+      sessionQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+  }
+
   private func routeSupportDetailsLocked(reason: String) -> [String: Any?] {
     let route = audioSession.currentRoute
     let inputs = route.inputs.map(\.portType.rawValue)
@@ -388,7 +483,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   }
 
   private func emitCurrentRouteEventLocked(type: String, reason: String) {
-    emitEvent(
+    emitSessionSnapshotLocked(
       type,
       [
         "reason": reason,
@@ -418,7 +513,13 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         try audioEngine.start()
       }
       emitCurrentRouteEventLocked(type: "route_applied", reason: trigger)
-      emitEvent("session_recovered", ["trigger": trigger, "route": currentRouteDescriptionLocked()])
+      emitSessionSnapshotLocked(
+        "session_recovered",
+        [
+          "trigger": trigger,
+          "route": currentRouteDescriptionLocked(),
+        ]
+      )
     } catch {
       emitEvent(
         "error",
@@ -515,7 +616,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
 
     if !captureFirstBufferLogged {
       captureFirstBufferLogged = true
-      emitEvent(
+      cancelCaptureStallProbesLocked()
+      emitSessionSnapshotLocked(
         "capture_buffer_first",
         [
           "sampleRateHz": Int(buffer.format.sampleRate),
@@ -648,6 +750,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     isSessionRunning = false
     captureFirstBufferLogged = false
     captureFirstChunkDelivered = false
+    cancelCaptureStallProbesLocked()
+    sessionStartedAtMs = nil
 
     if restoreAudioSession {
       do {
@@ -678,7 +782,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       }
       if !self.captureFirstChunkDelivered {
         self.captureFirstChunkDelivered = true
-        self.emitEvent(
+        self.cancelCaptureStallProbesLocked()
+        self.emitSessionSnapshotLocked(
           "capture_first_chunk",
           [
             "bytes": data.count,
