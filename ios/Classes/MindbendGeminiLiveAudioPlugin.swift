@@ -53,6 +53,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   private var captureFirstChunkDelivered = false
   private var observersRegistered = false
   private var captureStallProbeWorkItems: [DispatchWorkItem] = []
+  private var playbackProbeWorkItems: [DispatchWorkItem] = []
   private var sessionStartedAtMs: Int?
 
   public static func register(with registrar: FlutterPluginRegistrar) {
@@ -454,6 +455,13 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     captureStallProbeWorkItems.removeAll()
   }
 
+  private func cancelPlaybackProbesLocked() {
+    for workItem in playbackProbeWorkItems {
+      workItem.cancel()
+    }
+    playbackProbeWorkItems.removeAll()
+  }
+
   private func scheduleCaptureStallProbesLocked() {
     cancelCaptureStallProbesLocked()
     let probes: [(TimeInterval, String)] = [
@@ -473,6 +481,51 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         )
       }
       captureStallProbeWorkItems.append(workItem)
+      sessionQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+  }
+
+  private func playbackProgressDetailsLocked(probeLabel: String? = nil) -> [String: Any?] {
+    let playerRenderTime = playerNode?.lastRenderTime
+    let playerTime = playerRenderTime.flatMap { renderTime in
+      playerNode?.playerTime(forNodeTime: renderTime)
+    }
+    let outputRenderTime = engine?.outputNode.lastRenderTime
+    return [
+      "probeLabel": probeLabel,
+      "pendingPlaybackBufferCount": pendingPlaybackBufferCount,
+      "playbackChunkCount": playbackChunkCount,
+      "playbackCompletionCount": playbackCompletionCount,
+      "playbackBytesScheduled": playbackBytesScheduled,
+      "playerLastRenderHostTime": playerRenderTime?.hostTime as Any,
+      "playerLastRenderSampleTime": playerRenderTime?.sampleTime as Any,
+      "playerRenderSampleTime": playerTime?.sampleTime as Any,
+      "playerRenderTimeSeconds": playerTime.map { Double($0.sampleTime) / $0.sampleRate } as Any,
+      "playerRenderSampleRateHz": playerTime.map { Int($0.sampleRate.rounded()) } as Any,
+      "outputNodeLastRenderHostTime": outputRenderTime?.hostTime as Any,
+      "outputNodeLastRenderSampleTime": outputRenderTime?.sampleTime as Any,
+      "mainMixerOutputVolume": engine?.mainMixerNode.outputVolume as Any,
+      "playerVolume": playerNode?.volume as Any,
+    ]
+  }
+
+  private func schedulePlaybackProbesLocked() {
+    cancelPlaybackProbesLocked()
+    let probes: [(TimeInterval, String)] = [
+      (0.35, "350ms"),
+      (1.2, "1200ms"),
+      (3.0, "3000ms"),
+    ]
+    for (delay, label) in probes {
+      let workItem = DispatchWorkItem { [weak self] in
+        guard let self else { return }
+        guard self.isSessionRunning, self.playbackDidStart else { return }
+        self.emitSessionSnapshotLocked(
+          "playback_stall_probe",
+          self.playbackProgressDetailsLocked(probeLabel: label)
+        )
+      }
+      playbackProbeWorkItems.append(workItem)
       sessionQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
   }
@@ -827,6 +880,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     }
     if !playbackDidStart {
       playbackDidStart = true
+      schedulePlaybackProbesLocked()
       emitEvent(
         "playback_started",
         [
@@ -846,6 +900,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     player.play()
     playbackDidStart = false
     pendingPlaybackBufferCount = 0
+    cancelPlaybackProbesLocked()
     emitEvent("interrupted", ["route": currentRouteDescriptionLocked()])
     emitEvent("playback_stopped", ["route": currentRouteDescriptionLocked()])
   }
@@ -878,6 +933,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     captureFirstBufferLogged = false
     captureFirstChunkDelivered = false
     cancelCaptureStallProbesLocked()
+    cancelPlaybackProbesLocked()
     sessionStartedAtMs = nil
 
     if restoreAudioSession {
