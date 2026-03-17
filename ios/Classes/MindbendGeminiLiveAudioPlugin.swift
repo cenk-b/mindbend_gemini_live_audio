@@ -249,17 +249,21 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         self?.handleCapturedBuffer(buffer)
       }
 
-      audioEngine.prepare()
-      try audioEngine.start()
-      player.play()
-
       engine = audioEngine
       playerNode = player
       captureConverter = converter
       captureTargetFormat = targetCaptureFormat
       playbackFormat = outputPlaybackFormat
-      isSessionRunning = true
       sessionStartedAtMs = Int(Date().timeIntervalSince1970 * 1000)
+
+      try ensureEngineRunningLocked(
+        audioEngine,
+        player: player,
+        trigger: "session_start",
+        failureCode: "ios_engine_not_running_after_start"
+      )
+
+      isSessionRunning = true
       playbackDidStart = false
       captureChunkCount = 0
       captureFirstBufferLogged = false
@@ -299,12 +303,13 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         errorCode: nil
       )
     } catch {
+      let failureCode = nativeErrorCode(from: error) ?? "ios_start_failed"
       stopSessionLocked(restoreAudioSession: true)
-      emitEvent("error", ["code": "ios_start_failed"])
+      emitEvent("error", ["code": failureCode])
       return startResult(
         aecActive: false,
         transportMode: "legacy_half_duplex",
-        errorCode: "ios_start_failed"
+        errorCode: failureCode
       )
     }
   }
@@ -495,6 +500,76 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     }
   }
 
+  private func nativeErrorCode(from error: Error) -> String? {
+    let nsError = error as NSError
+    if let code = nsError.userInfo["errorCode"] as? String, !code.isEmpty {
+      return code
+    }
+    return nil
+  }
+
+  private func ensureEngineRunningLocked(
+    _ audioEngine: AVAudioEngine,
+    player: AVAudioPlayerNode,
+    trigger: String,
+    failureCode: String
+  ) throws {
+    let maxAttempts = 3
+    var lastThrownError: Error?
+
+    for attempt in 1...maxAttempts {
+      do {
+        try audioSession.setActive(true, options: [])
+        audioEngine.prepare()
+        if !audioEngine.isRunning {
+          try audioEngine.start()
+        }
+        if !player.isPlaying {
+          player.play()
+        }
+      } catch {
+        lastThrownError = error
+      }
+
+      emitSessionSnapshotLocked(
+        "engine_start_attempt",
+        [
+          "trigger": trigger,
+          "attempt": attempt,
+          "engineRunningCheck": audioEngine.isRunning,
+        ]
+      )
+
+      if audioEngine.isRunning {
+        return
+      }
+
+      if attempt < maxAttempts {
+        Thread.sleep(forTimeInterval: 0.05)
+      }
+    }
+
+    let error = NSError(
+      domain: "mindbend_gemini_live_audio",
+      code: -13,
+      userInfo: [
+        NSLocalizedDescriptionKey: "AVAudioEngine did not enter a running state.",
+        "errorCode": failureCode,
+        "trigger": trigger,
+      ]
+    )
+    var errorDetails: [String: Any?] = [
+      "code": failureCode,
+      "trigger": trigger,
+      "message": error.localizedDescription,
+    ]
+    if let lastThrownError {
+      errorDetails["underlyingError"] = lastThrownError.localizedDescription
+    }
+    emitSessionSnapshotLocked("error", errorDetails)
+    throw error
+  }
+
   private func recoverAudioSessionLocked(trigger: String) {
     guard isSessionRunning else { return }
     do {
@@ -504,13 +579,13 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         options: [.allowBluetooth, .defaultToSpeaker]
       )
       try audioSession.setPreferredIOBufferDuration(0.01)
-      try audioSession.setActive(true, options: [])
-      if let player = playerNode, !player.isPlaying {
-        player.play()
-      }
-      if let audioEngine = engine, !audioEngine.isRunning {
-        audioEngine.prepare()
-        try audioEngine.start()
+      if let audioEngine = engine, let player = playerNode {
+        try ensureEngineRunningLocked(
+          audioEngine,
+          player: player,
+          trigger: trigger,
+          failureCode: "ios_engine_not_running_after_recover"
+        )
       }
       emitCurrentRouteEventLocked(type: "route_applied", reason: trigger)
       emitSessionSnapshotLocked(
@@ -521,10 +596,11 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         ]
       )
     } catch {
+      let failureCode = nativeErrorCode(from: error) ?? "ios_session_recovery_failed"
       emitEvent(
         "error",
         [
-          "code": "ios_session_recovery_failed",
+          "code": failureCode,
           "trigger": trigger,
           "message": error.localizedDescription,
         ]
