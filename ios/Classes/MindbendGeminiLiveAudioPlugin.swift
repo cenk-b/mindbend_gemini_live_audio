@@ -54,6 +54,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   private var lastMixerRmsNormalized: Double?
   private var lastMixerPeakNormalized: Double?
   private var lastMixerBufferAtMs: Int?
+  private var playbackStartupConfirmed = false
+  private var playbackStartupRecoveryAttempted = false
   private var captureSinkMissingLogged = false
   private var captureFirstBufferLogged = false
   private var captureFirstChunkDelivered = false
@@ -295,6 +297,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       lastMixerRmsNormalized = nil
       lastMixerPeakNormalized = nil
       lastMixerBufferAtMs = nil
+      playbackStartupConfirmed = false
+      playbackStartupRecoveryAttempted = false
       captureFirstBufferLogged = false
       captureFirstChunkDelivered = false
       captureSinkMissingLogged = false
@@ -653,6 +657,20 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     if let value = stats["peakNormalized"] as? Double {
       lastMixerPeakNormalized = value
     }
+    if !playbackStartupConfirmed {
+      let nonZeroRatio = (stats["nonZeroRatio"] as? Double) ?? 0
+      let rmsNormalized = (stats["rmsNormalized"] as? Double) ?? 0
+      if nonZeroRatio > 0.05 || rmsNormalized > 0.002 {
+        playbackStartupConfirmed = true
+        emitSessionSnapshotLocked(
+          "playback_startup_confirmed",
+          [
+            "nonZeroRatio": nonZeroRatio,
+            "rmsNormalized": rmsNormalized,
+          ]
+        )
+      }
+    }
 
     if !mixerFirstBufferLogged {
       mixerFirstBufferLogged = true
@@ -682,14 +700,50 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       let workItem = DispatchWorkItem { [weak self] in
         guard let self else { return }
         guard self.isSessionRunning, self.playbackDidStart else { return }
+        let details = self.playbackProgressDetailsLocked(probeLabel: label)
         self.emitSessionSnapshotLocked(
           "playback_stall_probe",
-          self.playbackProgressDetailsLocked(probeLabel: label)
+          details
         )
+        if self.shouldAttemptSilentPlaybackStartupRecoveryLocked(
+          probeLabel: label,
+          details: details
+        ) {
+          self.reprimePlaybackLocked(reason: "startup_silent_\(label)", emitInterruption: false)
+        }
       }
       playbackProbeWorkItems.append(workItem)
       sessionQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
+  }
+
+  private func shouldAttemptSilentPlaybackStartupRecoveryLocked(
+    probeLabel: String,
+    details: [String: Any?]
+  ) -> Bool {
+    guard !playbackStartupConfirmed else { return false }
+    guard !playbackStartupRecoveryAttempted else { return false }
+    guard playbackDidStart else { return false }
+    guard probeLabel == "350ms" || probeLabel == "1200ms" else { return false }
+    guard playbackChunkCount > 0 else { return false }
+    guard playbackCompletionCount == 0 else { return false }
+    guard pendingPlaybackBufferCount > 0 else { return false }
+    guard mixerFirstBufferLogged else { return false }
+
+    let lastNonZero = lastMixerNonZeroRatio ?? 0
+    let lastRms = lastMixerRmsNormalized ?? 0
+    if lastNonZero > 0.001 || lastRms > 0.0005 {
+      return false
+    }
+
+    let playerRenderSampleTime = details["playerRenderSampleTime"] as? NSNumber
+    let outputRenderSampleTime = details["outputNodeLastRenderSampleTime"] as? NSNumber
+    let renderActive =
+      (playerRenderSampleTime?.int64Value ?? 0) > 0 ||
+      (outputRenderSampleTime?.int64Value ?? 0) > 0
+    guard renderActive else { return false }
+
+    return true
   }
 
   private func routeSupportDetailsLocked(reason: String) -> [String: Any?] {
@@ -1047,6 +1101,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     }
     if !playbackDidStart {
       playbackDidStart = true
+      playbackStartupConfirmed = false
       schedulePlaybackProbesLocked()
       emitEvent(
         "playback_started",
@@ -1059,8 +1114,24 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   }
 
   private func flushPlaybackLocked() {
+    reprimePlaybackLocked(reason: "flush_request", emitInterruption: true)
+  }
+
+  private func reprimePlaybackLocked(reason: String, emitInterruption: Bool) {
     guard isSessionRunning, let player = playerNode else {
       return
+    }
+    if !emitInterruption {
+      playbackStartupRecoveryAttempted = true
+      emitSessionSnapshotLocked(
+        "playback_startup_silent_recovery",
+        [
+          "reason": reason,
+          "pendingPlaybackBufferCount": pendingPlaybackBufferCount,
+          "playbackChunkCount": playbackChunkCount,
+          "playbackCompletionCount": playbackCompletionCount,
+        ]
+      )
     }
     player.stop()
     player.reset()
@@ -1073,9 +1144,19 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     lastMixerRmsNormalized = nil
     lastMixerPeakNormalized = nil
     lastMixerBufferAtMs = nil
+    playbackStartupConfirmed = false
     cancelPlaybackProbesLocked()
-    emitEvent("interrupted", ["route": currentRouteDescriptionLocked()])
-    emitEvent("playback_stopped", ["route": currentRouteDescriptionLocked()])
+    if emitInterruption {
+      emitEvent("interrupted", ["route": currentRouteDescriptionLocked()])
+      emitEvent("playback_stopped", ["route": currentRouteDescriptionLocked()])
+    } else {
+      emitSessionSnapshotLocked(
+        "playback_reprimed",
+        [
+          "reason": reason,
+        ]
+      )
+    }
   }
 
   private func markPlaybackCompleteLocked() {
