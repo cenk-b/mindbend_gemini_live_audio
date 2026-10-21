@@ -112,6 +112,10 @@ class FarewellPlaybackBarrier(
     /** True while a farewell turn can still drain or fail. The plugin polls only while this holds. */
     @Synchronized fun hasLiveTurn(): Boolean = turn?.terminal == false
 
+    /** The track holds bytes the cursor does not count (a write overlapped a flush). Until a [flushTrack] with no
+     *  write in flight clears it, every farewell fails closed with track_unsynced (adapter obligation). */
+    @Synchronized fun needsResync(): Boolean = unsynced
+
     @Synchronized fun begin(turnId: String, nativeGeneration: Int) {
         turn?.takeIf { !it.terminal }?.let { fail(it, "replaced") }
         epoch++

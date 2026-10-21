@@ -1,0 +1,28 @@
+PODS:
+  - Flutter (1.0.0)
+  - integration_test (0.0.1):
+    - Flutter
+  - mindbend_gemini_live_audio (0.0.1):
+    - Flutter
+
+DEPENDENCIES:
+  - Flutter (from `Flutter`)
+  - integration_test (from `.symlinks/plugins/integration_test/ios`)
+  - mindbend_gemini_live_audio (from `.symlinks/plugins/mindbend_gemini_live_audio/ios`)
+
+EXTERNAL SOURCES:
+  Flutter:
+    :path: Flutter
+  integration_test:
+    :path: ".symlinks/plugins/integration_test/ios"
+  mindbend_gemini_live_audio:
+    :path: ".symlinks/plugins/mindbend_gemini_live_audio/ios"
+
+SPEC CHECKSUMS:
+  Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
+  integration_test: 4a889634ef21a45d28d50d622cf412dc6d9f586e
+  mindbend_gemini_live_audio: d929b65969648e504e03f13a521d8c11bd120ba4
+
+PODFILE CHECKSUM: 64739ca56752e40e65ba642194496b2be6735f9e
+
+COCOAPODS: 1.16.2

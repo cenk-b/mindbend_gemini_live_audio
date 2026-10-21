@@ -258,7 +258,12 @@ class MindbendGeminiLiveAudioPlugin :
                     result.success(mapOf("accepted" to false, "reason" to "no_playback"))
                     return
                 }
-                barrier.begin(turnId, nativeGeneration)
+                // On the data lane: behind every earlier write, and never concurrent with one, so the resync
+                // flush (the barrier's documented adapter obligation after track_unsynced) can clear it.
+                lifetime.submit {
+                    if (barrier.needsResync()) barrier.flushTrack("resync")
+                    barrier.begin(turnId, nativeGeneration)
+                }
                 startFarewellPolling(barrier, lifetime)
                 result.success(mapOf("accepted" to true))
             }
