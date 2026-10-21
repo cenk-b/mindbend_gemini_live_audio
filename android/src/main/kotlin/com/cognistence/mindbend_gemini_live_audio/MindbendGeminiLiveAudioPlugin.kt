@@ -52,9 +52,9 @@ class MindbendGeminiLiveAudioPlugin :
     @Volatile private var playbackLifetime: RetiringPlaybackLifetime? = null
     /** One barrier per AudioTrack lifetime. Every write and flush of that track goes through it. */
     @Volatile private var farewellBarrier: FarewellPlaybackBarrier? = null
-    private val farewellPoller: ScheduledExecutorService =
-        Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "mb-farewell-poll").apply { isDaemon = true } }
-    private val farewellPollTask = AtomicReference<ScheduledFuture<*>?>(null)
+    private val farewellPoller = FarewellPoller(
+        Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "mb-farewell-poll").apply { isDaemon = true } },
+    )
 
     private var capturedAudioSink: EventChannel.EventSink? = null
     private var eventSink: EventChannel.EventSink? = null
@@ -258,13 +258,9 @@ class MindbendGeminiLiveAudioPlugin :
                     result.success(mapOf("accepted" to false, "reason" to "no_playback"))
                     return
                 }
-                // On the data lane: behind every earlier write, and never concurrent with one, so the resync
-                // flush (the barrier's documented adapter obligation after track_unsynced) can clear it.
-                lifetime.submit {
-                    if (barrier.needsResync()) barrier.flushTrack("resync")
-                    barrier.begin(turnId, nativeGeneration)
+                beginFarewellOnDataLane(barrier, lifetime, turnId, nativeGeneration) {
+                    farewellPoller.start(barrier, lifetime)
                 }
-                startFarewellPolling(barrier, lifetime)
                 result.success(mapOf("accepted" to true))
             }
             "farewellPush" -> {
@@ -322,7 +318,7 @@ class MindbendGeminiLiveAudioPlugin :
         capturedAudioChannel.setStreamHandler(null)
         eventChannel.setStreamHandler(null)
         playbackExecutor.shutdownNow()
-        farewellPoller.shutdownNow()
+        farewellPoller.shutdown()
         sessionExecutor.shutdown()
     }
 
@@ -697,7 +693,7 @@ class MindbendGeminiLiveAudioPlugin :
         farewellDrain.cancel()
         farewellBarrier?.invalidate("session_stopped")
         farewellBarrier = null
-        farewellPollTask.getAndSet(null)?.cancel(false)
+        farewellPoller.stop()
         playbackLifetime?.cancel()
         isSessionRunning.set(false)
         playbackGeneration.incrementAndGet()
@@ -768,22 +764,6 @@ class MindbendGeminiLiveAudioPlugin :
             "errorCode" to errorCode,
         )
 
-    /** Polls the barrier every 10 ms from BEGIN until the turn drains or fails (the barrier needs to
-     *  watch the crossing). A retired lifetime fails the turn instead of reading a released track. */
-    private fun startFarewellPolling(barrier: FarewellPlaybackBarrier, lifetime: RetiringPlaybackLifetime) {
-        val holder = AtomicReference<ScheduledFuture<*>?>(null)
-        val task = farewellPoller.scheduleAtFixedRate({
-            try {
-                if (lifetime.isRetired()) barrier.invalidate("playback_retired") else barrier.poll()
-            } catch (_: Throwable) {
-                barrier.invalidate("poll_failed")
-            }
-            if (!barrier.hasLiveTurn()) holder.get()?.cancel(false)
-        }, FAREWELL_POLL_MS, FAREWELL_POLL_MS, TimeUnit.MILLISECONDS)
-        holder.set(task)
-        farewellPollTask.getAndSet(task)?.cancel(false)
-    }
-
     private fun emitFarewellEvent(event: FarewellBarrierEvent) {
         when (event) {
             is FarewellBarrierEvent.Drained -> emitEvent(
@@ -840,7 +820,58 @@ class MindbendGeminiLiveAudioPlugin :
         const val PLAYBACK_SAMPLE_RATE_HZ = 24_000
         /** Attributed farewell playback API. 2 = farewellBegin/Push/End/Cancel + typed drain events. */
         const val FAREWELL_API_VERSION = 2
-        const val FAREWELL_POLL_MS = 10L
+    }
+}
+
+/**
+ * farewellBegin's body, on the playback data lane: behind every earlier write and never concurrent with one, so
+ * the resync flush (the barrier's adapter obligation after track_unsynced) can clear the cursor. Polling starts
+ * only AFTER the turn exists: a poller started earlier would see no live turn and stop (Review R1-F3).
+ */
+internal fun beginFarewellOnDataLane(
+    barrier: FarewellPlaybackBarrier,
+    lifetime: RetiringPlaybackLifetime,
+    turnId: String,
+    nativeGeneration: Int,
+    startPolling: () -> Unit,
+) {
+    lifetime.submit {
+        if (barrier.needsResync()) barrier.flushTrack("resync")
+        barrier.begin(turnId, nativeGeneration)
+        startPolling()
+    }
+}
+
+/** Polls a barrier every 10 ms from BEGIN until its turn drains or fails (the barrier must watch the crossing).
+ *  A retired lifetime fails the turn instead of reading a released track. One active task at a time. */
+internal class FarewellPoller(private val executor: ScheduledExecutorService) {
+    private val active = AtomicReference<ScheduledFuture<*>?>(null)
+
+    fun start(barrier: FarewellPlaybackBarrier, lifetime: RetiringPlaybackLifetime) {
+        val holder = AtomicReference<ScheduledFuture<*>?>(null)
+        val task = try {
+            executor.scheduleAtFixedRate({
+                try {
+                    if (lifetime.isRetired()) barrier.invalidate("playback_retired") else barrier.poll()
+                } catch (_: Throwable) {
+                    barrier.invalidate("poll_failed")
+                }
+                if (!barrier.hasLiveTurn()) holder.get()?.cancel(false)
+            }, POLL_MS, POLL_MS, TimeUnit.MILLISECONDS)
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            barrier.invalidate("poller_unavailable")
+            return
+        }
+        holder.set(task)
+        active.getAndSet(task)?.cancel(false)
+    }
+
+    fun stop() { active.getAndSet(null)?.cancel(false) }
+
+    fun shutdown() { stop(); executor.shutdownNow() }
+
+    private companion object {
+        const val POLL_MS = 10L
     }
 }
 

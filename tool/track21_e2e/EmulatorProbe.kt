@@ -24,11 +24,10 @@ private class Rig {
     val lifetime = RetiringPlaybackLifetime(stop = { track.pause(); track.flush(); track.stop() }, release = { track.release() })
     val events = CopyOnWriteArrayList<FarewellBarrierEvent>()
     val barrier = FarewellPlaybackBarrier(LifetimeAudioTrackPort(track, lifetime), { System.currentTimeMillis() }, { events.add(it) })
-    private val poller = Executors.newSingleThreadScheduledExecutor()
-    init {
-        track.play()
-        poller.scheduleAtFixedRate({ if (lifetime.isRetired()) barrier.invalidate("playback_retired") else barrier.poll() }, 10, 10, TimeUnit.MILLISECONDS)
-    }
+    // The plugin's own poller and begin path (farewellBegin): poll from BEGIN on the data lane.
+    private val poller = FarewellPoller(Executors.newSingleThreadScheduledExecutor())
+    init { track.play() }
+    fun begin(turnId: String, gen: Int) = beginFarewellOnDataLane(barrier, lifetime, turnId, gen) { poller.start(barrier, lifetime) }
     /** Queues on the data lane without waiting (a 2 s WRITE_BLOCKING push only returns near its end). */
     fun laneAsync(op: () -> Unit) { lifetime.submit(op) }
     fun lane(op: () -> Unit) {
@@ -44,7 +43,7 @@ private class Rig {
         }
         return null
     }
-    fun close() { poller.shutdownNow(); try { lifetime.cancel().get(5, TimeUnit.SECONDS) } catch (_: Throwable) {} }
+    fun close() { poller.shutdown(); try { lifetime.cancel().get(5, TimeUnit.SECONDS) } catch (_: Throwable) {} }
 }
 
 private var failures = 0
@@ -58,7 +57,7 @@ fun main() {
     run {
         val r = Rig()
         r.lane { r.barrier.pushLegacy(ByteArray(9600)) }  // 200 ms ordinary audio ahead
-        r.barrier.begin("fw_A", 1)
+        r.begin("fw_A", 1)
         r.lane { for (i in 0 until 4) require(r.barrier.push("fw_A", i, ByteArray(4800))) }
         val t0 = System.currentTimeMillis()
         r.barrier.end("fw_A", 4, 9600)
@@ -69,7 +68,7 @@ fun main() {
     }
     run {
         val r = Rig()
-        r.barrier.begin("fw_P", 1)
+        r.begin("fw_P", 1)
         r.laneAsync { r.barrier.push("fw_P", 0, ByteArray(96000)) }
         r.laneAsync { r.barrier.end("fw_P", 1, 48000) }
         Thread.sleep(300)
@@ -80,7 +79,7 @@ fun main() {
     }
     run {
         val r = Rig()
-        r.barrier.begin("fw_F", 1)
+        r.begin("fw_F", 1)
         r.laneAsync { r.barrier.push("fw_F", 0, ByteArray(96000)) }
         r.laneAsync { r.barrier.end("fw_F", 1, 48000) }
         Thread.sleep(300)
@@ -89,18 +88,15 @@ fun main() {
         check("barge_in_flush_mid_farewell_unverified", e is FarewellBarrierEvent.Unverified && e.reason == "barge_in", "event=$e")
         // The flush overlapped a parked write, so the track is unsynced. The plugin's farewellBegin resyncs on the
         // data lane (no write in flight) before beginning: the next farewell must drain on the same track.
-        var resynced = false
-        r.lane {
-            if (r.barrier.needsResync()) { resynced = true; r.barrier.flushTrack("resync") }
-            r.barrier.begin("fw_G", 2)
-        }
+        val resynced = r.barrier.needsResync()
+        r.begin("fw_G", 2)
         val t0 = System.currentTimeMillis()
         r.lane { require(r.barrier.push("fw_G", 0, ByteArray(9600))) }
         r.barrier.end("fw_G", 1, 4800)
         val g = r.await("fw_G")
         check("post_overlapping_flush_resync_then_drain", g is FarewellBarrierEvent.Drained && resynced,
             "resynced=$resynced event=$g endToDrainMs=${(g as? FarewellBarrierEvent.Drained)?.drainedAtEpochMs?.minus(t0)}")
-        r.barrier.begin("fw_H", 3)
+        r.begin("fw_H", 3)
         r.lane { require(r.barrier.push("fw_H", 0, ByteArray(9600))) }
         r.barrier.end("fw_H", 1, 4800)
         check("no_resync_needed_after_clean_flush", r.await("fw_H") is FarewellBarrierEvent.Drained && !r.barrier.needsResync(), "log=${r.barrier.log.takeLast(3)}")
@@ -108,7 +104,7 @@ fun main() {
     }
     run {
         val r = Rig()
-        r.barrier.begin("fw_R", 1)
+        r.begin("fw_R", 1)
         r.laneAsync { r.barrier.push("fw_R", 0, ByteArray(96000)) }
         r.laneAsync { r.barrier.end("fw_R", 1, 48000) }
         Thread.sleep(200)
@@ -119,7 +115,7 @@ fun main() {
     }
     run {
         val r = Rig()
-        r.barrier.begin("fw_T", 1)
+        r.begin("fw_T", 1)
         r.lane { require(r.barrier.push("fw_T", 0, ByteArray(4800))) }
         r.barrier.end("fw_T", 1, 2401)
         val e = r.await("fw_T")
@@ -128,13 +124,25 @@ fun main() {
     }
     run {
         val r = Rig()
-        r.barrier.begin("fw_C", 1)
+        r.begin("fw_C", 1)
         r.laneAsync { r.barrier.push("fw_C", 0, ByteArray(96000)) }
         r.laneAsync { r.barrier.end("fw_C", 1, 48000) }
         Thread.sleep(150)
         r.barrier.cancel("fw_C", "user_done")
         val e = r.await("fw_C")
         check("cancel_mid_farewell_unverified", e is FarewellBarrierEvent.Unverified && e.reason == "user_done", "event=$e")
+        r.close()
+    }
+    run {
+        // Review R1-F3: BEGIN queued behind a long blocking legacy write must still be polled and drain.
+        val r = Rig()
+        r.laneAsync { r.barrier.pushLegacy(ByteArray(72000)) } // 1.5 s of ordinary audio parks the data lane
+        Thread.sleep(50)
+        r.begin("fw_Q", 4)
+        r.laneAsync { r.barrier.push("fw_Q", 0, ByteArray(9600)) }
+        r.laneAsync { r.barrier.end("fw_Q", 1, 4800) }
+        val e = r.await("fw_Q", 10000)
+        check("begin_queued_behind_blocking_write_drains", e is FarewellBarrierEvent.Drained, "event=$e")
         r.close()
     }
     println("T21_EMULATOR_PROBE_RESULT failures=$failures")

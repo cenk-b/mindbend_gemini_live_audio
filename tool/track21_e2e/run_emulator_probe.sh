@@ -13,7 +13,7 @@ rm -rf "$OUT/classes"; mkdir -p "$OUT/classes"
 bash "$KH/bin/kotlinc" "$K/FarewellPlaybackBarrier.kt" "$K/RetiringPlaybackLifetime.kt" "$K/MindbendGeminiLiveAudioPlugin.kt" \
   "$HERE/EmulatorProbe.kt" -cp "$AJAR:$FE" -d "$OUT/classes" 2>&1 | grep -E "error:" && exit 2
 # Only the classes the probe needs (the plugin class itself references the Flutter embedding).
-(cd "$OUT/classes" && find . -name '*.class' | grep -E "FarewellPlaybackBarrier|FarewellTrack|FarewellBarrierEvent|LifetimeAudioTrackPort|RetiringPlaybackLifetime|EmulatorProbe|/Rig" > ../keep.txt && jar cf ../probe-classes.jar @../keep.txt)
+(cd "$OUT/classes" && find . -name '*.class' | grep -E "FarewellPlaybackBarrier|FarewellTrack|FarewellBarrierEvent|LifetimeAudioTrackPort|RetiringPlaybackLifetime|FarewellPoller|MindbendGeminiLiveAudioPluginKt|EmulatorProbe|/Rig" > ../keep.txt && jar cf ../probe-classes.jar @../keep.txt)
 "$D8" --min-api 26 --lib "$AJAR" --output "$OUT" "$OUT/probe-classes.jar" "$KH/lib/kotlin-stdlib.jar" 2>&1 | grep -vi warning || true
 (cd "$OUT" && jar cf probe.jar classes*.dex)
 shasum -a 256 "$K/FarewellPlaybackBarrier.kt" "$K/RetiringPlaybackLifetime.kt" "$K/MindbendGeminiLiveAudioPlugin.kt" "$OUT/probe.jar"
