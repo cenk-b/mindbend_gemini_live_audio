@@ -123,6 +123,15 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     get { lifetimeLock.lock(); defer { lifetimeLock.unlock() }; return _playbackLifetime }
     set { lifetimeLock.lock(); _playbackLifetime = newValue; lifetimeLock.unlock() }
   }
+  /// One barrier per playback lifetime. Read from the platform thread by the cancel path.
+  private var _farewellBarrier: FarewellPlaybackBarrier?
+  private var farewellBarrier: FarewellPlaybackBarrier? {
+    get { lifetimeLock.lock(); defer { lifetimeLock.unlock() }; return _farewellBarrier }
+    set { lifetimeLock.lock(); _farewellBarrier = newValue; lifetimeLock.unlock() }
+  }
+  private var engineConfigurationObserver: NSObjectProtocol?
+  /// Attributed farewell playback API. 2 = farewellBegin/Push/End/Cancel + typed drain events.
+  private static let farewellApiVersion = 2
   private let audioSession = AVAudioSession.sharedInstance()
 
   private var captureStreamHandler: ClosureStreamHandler?
@@ -224,6 +233,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       }
     case "stopSession":
       invalidatePendingStart()
+      farewellBarrier?.invalidateAsync(reason: "session_stopped")
       playbackLifetime?.cancel()
       sessionQueue.async { [weak self] in
         self?.stopSessionLocked(restoreAudioSession: true)
@@ -284,6 +294,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     case "cancelFarewellDrain":
       invalidatePendingStart()
       // The platform handler never waits on sessionQueue (which may be parked in schedule/play).
+      farewellBarrier?.invalidateAsync(reason: "playback_cancelled")
       let lifetime = playbackLifetime
       lifetime?.cancel { state in
         DispatchQueue.main.async {
@@ -318,6 +329,64 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         let payload = self.farewellDrain.status()
         DispatchQueue.main.async { result(payload) }
       }
+    case "farewellCapabilities":
+      result([
+        "api": Self.farewellApiVersion,
+        "attributedDrain": true,
+        "platform": "ios",
+        "evidence": "ios_dataPlayedBack+position",
+      ])
+    case "farewellBegin":
+      let args = call.arguments as? [String: Any]
+      guard let turnId = args?["turnId"] as? String, !turnId.isEmpty,
+            let nativeGeneration = args?["nativeGeneration"] as? Int else {
+        result(["accepted": false, "reason": "invalid_arguments"])
+        return
+      }
+      sessionQueue.async { [weak self] in
+        guard let self, self.isSessionRunning, let barrier = self.farewellBarrier,
+              let lifetime = self.playbackLifetime, !lifetime.isRetired else {
+          DispatchQueue.main.async { result(["accepted": false, "reason": "no_playback"]) }
+          return
+        }
+        barrier.begin(turnId: turnId, nativeGeneration: nativeGeneration)
+        DispatchQueue.main.async { result(["accepted": true]) }
+      }
+    case "farewellPush":
+      let args = call.arguments as? [String: Any]
+      guard let turnId = args?["turnId"] as? String, !turnId.isEmpty,
+            let seq = args?["seq"] as? Int,
+            let pcm = Self.decodeBytes(args?["pcm"]) else {
+        result(false)
+        return
+      }
+      // Same serial queue as legacy audio, so the barrier sees farewell and legacy in scheduling order.
+      sessionQueue.async { [weak self] in
+        let accepted = self?.farewellBarrier?.push(turnId: turnId, seq: seq, pcm16: pcm) ?? false
+        DispatchQueue.main.async { result(accepted) }
+      }
+    case "farewellEnd":
+      let args = call.arguments as? [String: Any]
+      guard let turnId = args?["turnId"] as? String, !turnId.isEmpty,
+            let totalChunks = args?["totalChunks"] as? Int,
+            let totalFrames = (args?["totalFrames"] as? NSNumber)?.int64Value else {
+        result(false)
+        return
+      }
+      sessionQueue.async { [weak self] in
+        guard let barrier = self?.farewellBarrier else {
+          DispatchQueue.main.async { result(false) }
+          return
+        }
+        barrier.end(turnId: turnId, totalChunks: totalChunks, totalFrames: totalFrames)
+        DispatchQueue.main.async { result(true) }
+      }
+    case "farewellCancel":
+      let args = call.arguments as? [String: Any]
+      if let turnId = args?["turnId"] as? String, !turnId.isEmpty {
+        farewellBarrier?.cancel(turnId: turnId, reason: (args?["reason"] as? String) ?? "cancelled")
+      }
+      result(true)
     case "setDebugOptions":
       result(nil)
     default:
@@ -429,7 +498,24 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
 
       engine = audioEngine
       playerNode = player
-      playbackLifetime = RetiringPlaybackLifetime(stop: { player.stop() })
+      let barrierBox = FarewellBarrierBox()
+      let lifetime = RetiringPlaybackLifetime(stop: {
+        // A retired player can never prove a drain. Async: this runs on the independent control queue.
+        barrierBox.barrier?.invalidateAsync(reason: "playback_retired")
+        player.stop()
+      })
+      playbackLifetime = lifetime
+      let barrier = FarewellPlaybackBarrier(
+        player: PluginFarewellPlayer(engine: audioEngine, node: player, format: outputPlaybackFormat, lifetime: lifetime),
+        emit: { [weak self] event in self?.emitFarewellEvent(event) }
+      )
+      barrierBox.barrier = barrier
+      farewellBarrier = barrier
+      engineConfigurationObserver = NotificationCenter.default.addObserver(
+        forName: .AVAudioEngineConfigurationChange, object: audioEngine, queue: nil
+      ) { [weak barrier] _ in
+        barrier?.invalidateAsync(reason: "engine_configuration_change")
+      }
       if requestGeneration != captureControlGeneration() {
         playbackLifetime?.cancel()
         throw NSError(domain: "mindbend_gemini_live_audio", code: -30,
@@ -1109,6 +1195,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
 
       switch type {
       case .began:
+        self.farewellBarrier?.invalidate(reason: "interrupted")
         self.emitEvent(
           "interruption_began",
           ["route": self.currentRouteDescriptionLocked()]
@@ -1142,6 +1229,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
           let outputs = route.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
           return "inputs=[\(inputs)] outputs=[\(outputs)]"
         }
+      self.farewellBarrier?.invalidate(reason: "route_changed")
       self.emitEvent(
         "route_changed",
         [
@@ -1159,6 +1247,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
 
   @objc private func handleMediaServicesWereLost(_ notification: Notification) {
     sessionQueue.async { [weak self] in
+      self?.farewellBarrier?.invalidate(reason: "media_services_lost")
       self?.emitEvent("media_services_lost")
     }
   }
@@ -1166,6 +1255,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   @objc private func handleMediaServicesWereReset(_ notification: Notification) {
     sessionQueue.async { [weak self] in
       guard let self else { return }
+      self.farewellBarrier?.invalidate(reason: "media_services_reset")
       self.emitEvent("media_services_reset")
       self.recoverAudioSessionLocked(trigger: "media_services_reset")
     }
@@ -1265,6 +1355,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     bytes.copyBytes(to: mData.assumingMemoryBound(to: UInt8.self), count: bytes.count)
     audioBufferList[0].mDataByteSize = UInt32(bytes.count)
 
+    // The barrier must know every buffer that lands on this player's timeline ahead of a farewell.
+    farewellBarrier?.noteLegacyScheduled(frames: Int64(frameCount))
     playbackChunkCount += 1
     playbackBytesScheduled += bytes.count
     pendingPlaybackBufferCount += 1
@@ -1348,6 +1440,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     }
     player.stop()
     player.reset()
+    farewellBarrier?.noteTimelineReset(reason: "playback_reprimed")
     if let lifetime = playbackLifetime, !lifetime.isRetired, !farewellDrain.restartBlocked {
       _ = lifetime.boundary { player.play() }
     }
@@ -1381,6 +1474,12 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   }
 
   private func stopSessionLocked(restoreAudioSession: Bool) {
+    farewellBarrier?.noteTimelineReset(reason: "session_stopped")
+    farewellBarrier = nil
+    if let observer = engineConfigurationObserver {
+      NotificationCenter.default.removeObserver(observer)
+      engineConfigurationObserver = nil
+    }
     playbackLifetime?.cancel()
     _ = farewellDrain.cancel()
     if let inputNode = engine?.inputNode {
@@ -1432,6 +1531,26 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     unregisterAudioSessionObserversLocked()
   }
 
+  private func emitFarewellEvent(_ event: FarewellBarrierEvent) {
+    switch event {
+    case let .drained(turnId, nativeGeneration, drainedAtEpochMs, framesPlayed, lastSeq, evidence):
+      emitEvent("farewell_drained", [
+        "turnId": turnId,
+        "nativeGeneration": nativeGeneration,
+        "drainedAtEpochMs": drainedAtEpochMs,
+        "framesPlayed": framesPlayed,
+        "lastSeq": lastSeq,
+        "evidence": evidence,
+      ])
+    case let .unverified(turnId, nativeGeneration, reason):
+      emitEvent("farewell_unverified", [
+        "turnId": turnId,
+        "nativeGeneration": nativeGeneration,
+        "reason": reason,
+      ])
+    }
+  }
+
   private func emitCapturedAudio(_ data: Data) {
     // Avoid capturing a stale sink closure across async hops. During
     // hot-restart/dispose, EventChannel callbacks can be deleted while queued
@@ -1477,4 +1596,9 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       sink(payload)
     }
   }
+}
+
+/// Lets a lifetime's stop closure reach the barrier that is created after the lifetime.
+private final class FarewellBarrierBox {
+  var barrier: FarewellPlaybackBarrier?
 }

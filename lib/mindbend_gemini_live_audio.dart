@@ -193,6 +193,110 @@ class FarewellDrainStatus {
   }
 }
 
+/// What the installed native plugin can prove about farewell playback.
+///
+/// `api >= 2` with `attributedDrain` means the native side owns a per-track
+/// playback barrier and reports typed `farewell_drained` / `farewell_unverified`
+/// events. An older plugin reports `api == 0` and must never be treated as able
+/// to prove a farewell played.
+class FarewellPlaybackCapabilities {
+  const FarewellPlaybackCapabilities({
+    required this.api,
+    required this.attributedDrain,
+    this.platform,
+    this.evidence,
+  });
+
+  static const FarewellPlaybackCapabilities none =
+      FarewellPlaybackCapabilities(api: 0, attributedDrain: false);
+
+  final int api;
+  final bool attributedDrain;
+  final String? platform;
+  final String? evidence;
+
+  bool get supportsAttributedDrain => api >= 2 && attributedDrain;
+
+  factory FarewellPlaybackCapabilities.fromMap(Map<Object?, Object?> raw) {
+    final api = raw['api'];
+    return FarewellPlaybackCapabilities(
+      api: api is int ? api : (api is num ? api.toInt() : 0),
+      attributedDrain: raw['attributedDrain'] == true,
+      platform: raw['platform'] is String ? raw['platform'] as String : null,
+      evidence: raw['evidence'] is String ? raw['evidence'] as String : null,
+    );
+  }
+}
+
+/// Typed native farewell outcome, parsed from the plugin event stream.
+sealed class FarewellPlaybackEvent {
+  const FarewellPlaybackEvent(this.turnId, this.nativeGeneration);
+
+  final String turnId;
+  final int nativeGeneration;
+
+  /// Null for every event that is not a well-formed farewell outcome.
+  static FarewellPlaybackEvent? tryParse(GeminiLiveAudioEvent event) {
+    final data = event.data;
+    final turnId = data['turnId'];
+    final generation = data['nativeGeneration'];
+    if (turnId is! String || turnId.isEmpty || generation is! int) return null;
+    if (event.type == 'farewell_drained') {
+      final drainedAt = data['drainedAtEpochMs'];
+      final frames = data['framesPlayed'];
+      final lastSeq = data['lastSeq'];
+      final evidence = data['evidence'];
+      if (drainedAt is! int || frames is! int || lastSeq is! int ||
+          evidence is! String || evidence.isEmpty) {
+        return null;
+      }
+      return FarewellPlaybackDrained(
+        turnId,
+        generation,
+        drainedAtEpochMs: drainedAt,
+        framesPlayed: frames,
+        lastSeq: lastSeq,
+        evidence: evidence,
+      );
+    }
+    if (event.type == 'farewell_unverified') {
+      final reason = data['reason'];
+      return FarewellPlaybackUnverified(
+        turnId,
+        generation,
+        reason is String && reason.isNotEmpty ? reason : 'unverified',
+      );
+    }
+    return null;
+  }
+}
+
+/// The native barrier observed the farewell's final frame presented by the
+/// installed player/track. [drainedAtEpochMs] is captured once, natively.
+class FarewellPlaybackDrained extends FarewellPlaybackEvent {
+  const FarewellPlaybackDrained(
+    super.turnId,
+    super.nativeGeneration, {
+    required this.drainedAtEpochMs,
+    required this.framesPlayed,
+    required this.lastSeq,
+    required this.evidence,
+  });
+
+  final int drainedAtEpochMs;
+  final int framesPlayed;
+  final int lastSeq;
+
+  /// `android_timestamp` or `ios_dataPlayedBack+position`.
+  final String evidence;
+}
+
+class FarewellPlaybackUnverified extends FarewellPlaybackEvent {
+  const FarewellPlaybackUnverified(super.turnId, super.nativeGeneration, this.reason);
+
+  final String reason;
+}
+
 class MindbendGeminiLiveAudio {
   Future<GeminiLiveAudioStartResult> startSession() {
     return MindbendGeminiLiveAudioPlatform.instance.startSession();
@@ -246,6 +350,37 @@ class MindbendGeminiLiveAudio {
 
   Future<void> setDebugOptions(GeminiLiveAudioDebugOptions options) {
     return MindbendGeminiLiveAudioPlatform.instance.setDebugOptions(options);
+  }
+
+  /// Never throws: an older native plugin reports [FarewellPlaybackCapabilities.none].
+  Future<FarewellPlaybackCapabilities> farewellCapabilities() {
+    return MindbendGeminiLiveAudioPlatform.instance.farewellCapabilities();
+  }
+
+  /// Opens one attributed farewell turn on the current playback track.
+  Future<bool> beginFarewell({required String turnId, required int nativeGeneration}) {
+    return MindbendGeminiLiveAudioPlatform.instance.beginFarewell(
+      turnId: turnId,
+      nativeGeneration: nativeGeneration,
+    );
+  }
+
+  /// Queues one farewell chunk behind earlier audio. A native rejection fails
+  /// the turn and arrives as [FarewellPlaybackUnverified].
+  Future<bool> pushFarewell({required String turnId, required int seq, required Uint8List pcm}) {
+    return MindbendGeminiLiveAudioPlatform.instance.pushFarewell(turnId: turnId, seq: seq, pcm: pcm);
+  }
+
+  Future<bool> endFarewell({required String turnId, required int totalChunks, required int totalFrames}) {
+    return MindbendGeminiLiveAudioPlatform.instance.endFarewell(
+      turnId: turnId,
+      totalChunks: totalChunks,
+      totalFrames: totalFrames,
+    );
+  }
+
+  Future<void> cancelFarewell({required String turnId, required String reason}) {
+    return MindbendGeminiLiveAudioPlatform.instance.cancelFarewell(turnId: turnId, reason: reason);
   }
 
   Stream<Uint8List> get capturedAudio16kStream =>

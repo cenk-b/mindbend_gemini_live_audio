@@ -120,6 +120,56 @@ class MethodChannelMindbendGeminiLiveAudio
   }
 
   @override
+  Future<FarewellPlaybackCapabilities> farewellCapabilities() async {
+    try {
+      final raw = await methodChannel.invokeMethod<Object?>('farewellCapabilities');
+      if (raw is Map) return FarewellPlaybackCapabilities.fromMap(raw);
+    } on MissingPluginException {
+      // Older native plugin: no attributed farewell playback.
+    } on PlatformException {
+      // Treated the same: the capability is never assumed.
+    }
+    return FarewellPlaybackCapabilities.none;
+  }
+
+  @override
+  Future<bool> beginFarewell({required String turnId, required int nativeGeneration}) async {
+    final raw = await methodChannel.invokeMethod<Object?>('farewellBegin', <String, Object?>{
+      'turnId': turnId,
+      'nativeGeneration': nativeGeneration,
+    });
+    return raw is Map && raw['accepted'] == true;
+  }
+
+  @override
+  Future<bool> pushFarewell({required String turnId, required int seq, required Uint8List pcm}) async {
+    final raw = await methodChannel.invokeMethod<Object?>('farewellPush', <String, Object?>{
+      'turnId': turnId,
+      'seq': seq,
+      'pcm': pcm,
+    });
+    return raw == true;
+  }
+
+  @override
+  Future<bool> endFarewell({required String turnId, required int totalChunks, required int totalFrames}) async {
+    final raw = await methodChannel.invokeMethod<Object?>('farewellEnd', <String, Object?>{
+      'turnId': turnId,
+      'totalChunks': totalChunks,
+      'totalFrames': totalFrames,
+    });
+    return raw == true;
+  }
+
+  @override
+  Future<void> cancelFarewell({required String turnId, required String reason}) async {
+    await methodChannel.invokeMethod<Object?>('farewellCancel', <String, Object?>{
+      'turnId': turnId,
+      'reason': reason,
+    });
+  }
+
+  @override
   Stream<Uint8List> get capturedAudio16kStream {
     _capturedAudio16kStream ??= capturedAudioChannel
         .receiveBroadcastStream()

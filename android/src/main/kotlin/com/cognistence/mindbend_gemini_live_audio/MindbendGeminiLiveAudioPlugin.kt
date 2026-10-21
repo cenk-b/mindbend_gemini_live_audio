@@ -11,6 +11,7 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioFocusRequest
 import android.media.AudioRecord
+import android.media.AudioTimestamp
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
@@ -26,8 +27,12 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 class MindbendGeminiLiveAudioPlugin :
     FlutterPlugin,
@@ -45,6 +50,11 @@ class MindbendGeminiLiveAudioPlugin :
     private val sessionExecutor = Executors.newSingleThreadExecutor()
     private val farewellDrain = FarewellDrainGate()
     @Volatile private var playbackLifetime: RetiringPlaybackLifetime? = null
+    /** One barrier per AudioTrack lifetime. Every write and flush of that track goes through it. */
+    @Volatile private var farewellBarrier: FarewellPlaybackBarrier? = null
+    private val farewellPoller: ScheduledExecutorService =
+        Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "mb-farewell-poll").apply { isDaemon = true } }
+    private val farewellPollTask = AtomicReference<ScheduledFuture<*>?>(null)
 
     private var capturedAudioSink: EventChannel.EventSink? = null
     private var eventSink: EventChannel.EventSink? = null
@@ -90,6 +100,7 @@ class MindbendGeminiLiveAudioPlugin :
                     focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
                     focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
             ) {
+                farewellBarrier?.invalidate("audio_focus_loss")
                 emitEvent("interruption_began")
             } else if (
                 focusChange == AudioManager.AUDIOFOCUS_GAIN ||
@@ -105,6 +116,7 @@ class MindbendGeminiLiveAudioPlugin :
         object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 if (AudioManager.ACTION_AUDIO_BECOMING_NOISY == intent?.action) {
+                    farewellBarrier?.invalidate("route_changed")
                     emitEvent("route_changed", mapOf("reason" to "becoming_noisy", "route" to currentRouteDescription()))
                 }
             }
@@ -114,6 +126,7 @@ class MindbendGeminiLiveAudioPlugin :
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             object : AudioDeviceCallback() {
                 override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                    farewellBarrier?.invalidate("route_changed")
                     emitEvent(
                         "route_changed",
                         mapOf("reason" to "devices_added", "route" to currentRouteDescription()),
@@ -121,6 +134,7 @@ class MindbendGeminiLiveAudioPlugin :
                 }
 
                 override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                    farewellBarrier?.invalidate("route_changed")
                     emitEvent(
                         "route_changed",
                         mapOf("reason" to "devices_removed", "route" to currentRouteDescription()),
@@ -225,6 +239,68 @@ class MindbendGeminiLiveAudioPlugin :
                 )
             }
             "farewellDrainStatus" -> result.success(farewellDrain.status())
+            "farewellCapabilities" -> result.success(
+                mapOf(
+                    "api" to FAREWELL_API_VERSION,
+                    "attributedDrain" to true,
+                    "platform" to "android",
+                    "evidence" to "android_timestamp",
+                ),
+            )
+            "farewellBegin" -> {
+                val turnId = call.argument<String>("turnId")
+                val nativeGeneration = call.argument<Number>("nativeGeneration")?.toInt()
+                val barrier = farewellBarrier
+                val lifetime = playbackLifetime
+                if (turnId.isNullOrEmpty() || nativeGeneration == null || barrier == null ||
+                    lifetime == null || lifetime.isRetired() || !isSessionRunning.get()
+                ) {
+                    result.success(mapOf("accepted" to false, "reason" to "no_playback"))
+                    return
+                }
+                barrier.begin(turnId, nativeGeneration)
+                startFarewellPolling(barrier, lifetime)
+                result.success(mapOf("accepted" to true))
+            }
+            "farewellPush" -> {
+                val turnId = call.argument<String>("turnId")
+                val seq = call.argument<Number>("seq")?.toInt()
+                val pcm = call.argument<ByteArray>("pcm")
+                val barrier = farewellBarrier
+                val lifetime = playbackLifetime
+                if (turnId.isNullOrEmpty() || seq == null || pcm == null || barrier == null ||
+                    lifetime == null || lifetime.isRetired()
+                ) {
+                    result.success(false)
+                    return
+                }
+                // Same data lane as legacy audio, so frame accounting follows the track's write order.
+                // A rejected write fails the turn inside the barrier and arrives as farewell_unverified.
+                lifetime.submit { barrier.push(turnId, seq, pcm) }
+                result.success(true)
+            }
+            "farewellEnd" -> {
+                val turnId = call.argument<String>("turnId")
+                val totalChunks = call.argument<Number>("totalChunks")?.toInt()
+                val totalFrames = call.argument<Number>("totalFrames")?.toLong()
+                val barrier = farewellBarrier
+                val lifetime = playbackLifetime
+                if (turnId.isNullOrEmpty() || totalChunks == null || totalFrames == null ||
+                    barrier == null || lifetime == null || lifetime.isRetired()
+                ) {
+                    result.success(false)
+                    return
+                }
+                // Queued behind every push of this turn on the data lane.
+                lifetime.submit { barrier.end(turnId, totalChunks, totalFrames) }
+                result.success(true)
+            }
+            "farewellCancel" -> {
+                val turnId = call.argument<String>("turnId")
+                val reason = call.argument<String>("reason") ?: "cancelled"
+                if (!turnId.isNullOrEmpty()) farewellBarrier?.cancel(turnId, reason)
+                result.success(true)
+            }
             "setDebugOptions" -> {
                 val args = call.arguments as? Map<*, *>
                 disableNoiseSuppressor = args?.get("disableNoiseSuppressor") as? Boolean ?: false
@@ -241,6 +317,7 @@ class MindbendGeminiLiveAudioPlugin :
         capturedAudioChannel.setStreamHandler(null)
         eventChannel.setStreamHandler(null)
         playbackExecutor.shutdownNow()
+        farewellPoller.shutdownNow()
         sessionExecutor.shutdown()
     }
 
@@ -350,8 +427,11 @@ class MindbendGeminiLiveAudioPlugin :
 
             audioRecord = record
             audioTrack = track
+            var barrierOfLifetime: FarewellPlaybackBarrier? = null
             playbackLifetime = RetiringPlaybackLifetime(
                 stop = {
+                    // A retired track can never prove a drain.
+                    barrierOfLifetime?.invalidate("playback_retired")
                     // Each action is attempted even if another fails.
                     var failure: Throwable? = null
                     try { track.pause() } catch (t: Throwable) { failure = t }
@@ -361,6 +441,13 @@ class MindbendGeminiLiveAudioPlugin :
                 },
                 release = { track.release() },
             )
+            // Created on the fresh track, before any write: the barrier's frame cursor and the track agree.
+            barrierOfLifetime = FarewellPlaybackBarrier(
+                track = LifetimeAudioTrackPort(track, playbackLifetime!!),
+                nowMs = System::currentTimeMillis,
+                emit = ::emitFarewellEvent,
+            )
+            farewellBarrier = barrierOfLifetime
             acousticEchoCanceler = echoCanceler
             noiseSuppressor = ns
             automaticGainControl = agc
@@ -547,11 +634,11 @@ class MindbendGeminiLiveAudioPlugin :
         }
         val generationAtEnqueue = playbackGeneration.get()
         val lifetime = playbackLifetime ?: return
+        val barrier = farewellBarrier ?: return
         lifetime.submit {
             if (!isSessionRunning.get() || generationAtEnqueue != playbackGeneration.get()) {
                 return@submit
             }
-            val track = audioTrack ?: return@submit
             if (!playbackStarted) {
                 playbackStarted = true
                 emitEvent(
@@ -559,20 +646,13 @@ class MindbendGeminiLiveAudioPlugin :
                     mapOf("bytes" to bytes.size, "route" to currentRouteDescription()),
                 )
             }
-            var offset = 0
-            while (offset < bytes.size && isSessionRunning.get()) {
-                if (generationAtEnqueue != playbackGeneration.get()) {
+            // Ordinary audio keeps its path but is written through the barrier's write gate, so the
+            // barrier's frame cursor covers every byte this track holds.
+            if (!barrier.pushLegacy(bytes)) {
+                if (generationAtEnqueue != playbackGeneration.get() || lifetime.isRetired()) {
                     return@submit
                 }
-                val written = lifetime.boundary { track.write(bytes, offset, bytes.size - offset, AudioTrack.WRITE_BLOCKING) } ?: return@submit
-                if (written <= 0) {
-                    if (generationAtEnqueue != playbackGeneration.get()) {
-                        return@submit
-                    }
-                    emitEvent("error", mapOf("code" to "android_playback_write_$written"))
-                    return@submit
-                }
-                offset += written
+                emitEvent("error", mapOf("code" to "android_playback_write_failed"))
             }
         }
     }
@@ -582,15 +662,16 @@ class MindbendGeminiLiveAudioPlugin :
         if (!isSessionRunning.get()) return
         val nextGeneration = playbackGeneration.incrementAndGet()
         val lifetime = playbackLifetime ?: return
+        val barrier = farewellBarrier ?: return
         lifetime.submit {
             if (!isSessionRunning.get() || nextGeneration != playbackGeneration.get()) {
                 return@submit
             }
-            val track = audioTrack ?: return@submit
             try {
-                lifetime.boundary { track.pause() } ?: return@submit
-                lifetime.boundary { track.flush() } ?: return@submit
-                lifetime.boundary { track.play() } ?: return@submit
+                // The barrier orders the discard (pause, verify not playing, flush, resume) and
+                // re-anchors its cursor on the emptied track. Never stop(): it does not discard.
+                barrier.flushTrack("barge_in")
+                if (lifetime.isRetired()) return@submit
                 playbackStarted = false
                 emitEvent("interrupted", mapOf("route" to currentRouteDescription()))
                 emitEvent("playback_stopped", mapOf("route" to currentRouteDescription()))
@@ -609,6 +690,9 @@ class MindbendGeminiLiveAudioPlugin :
     @Synchronized
     private fun stopSessionInternal(restoreAudioState: Boolean) {
         farewellDrain.cancel()
+        farewellBarrier?.invalidate("session_stopped")
+        farewellBarrier = null
+        farewellPollTask.getAndSet(null)?.cancel(false)
         playbackLifetime?.cancel()
         isSessionRunning.set(false)
         playbackGeneration.incrementAndGet()
@@ -679,6 +763,46 @@ class MindbendGeminiLiveAudioPlugin :
             "errorCode" to errorCode,
         )
 
+    /** Polls the barrier every 10 ms from BEGIN until the turn drains or fails (the barrier needs to
+     *  watch the crossing). A retired lifetime fails the turn instead of reading a released track. */
+    private fun startFarewellPolling(barrier: FarewellPlaybackBarrier, lifetime: RetiringPlaybackLifetime) {
+        val holder = AtomicReference<ScheduledFuture<*>?>(null)
+        val task = farewellPoller.scheduleAtFixedRate({
+            try {
+                if (lifetime.isRetired()) barrier.invalidate("playback_retired") else barrier.poll()
+            } catch (_: Throwable) {
+                barrier.invalidate("poll_failed")
+            }
+            if (!barrier.hasLiveTurn()) holder.get()?.cancel(false)
+        }, FAREWELL_POLL_MS, FAREWELL_POLL_MS, TimeUnit.MILLISECONDS)
+        holder.set(task)
+        farewellPollTask.getAndSet(task)?.cancel(false)
+    }
+
+    private fun emitFarewellEvent(event: FarewellBarrierEvent) {
+        when (event) {
+            is FarewellBarrierEvent.Drained -> emitEvent(
+                "farewell_drained",
+                mapOf(
+                    "turnId" to event.turnId,
+                    "nativeGeneration" to event.nativeGeneration,
+                    "drainedAtEpochMs" to event.drainedAtEpochMs,
+                    "framesPlayed" to event.framesPlayed,
+                    "lastSeq" to event.lastSeq,
+                    "evidence" to event.evidence,
+                ),
+            )
+            is FarewellBarrierEvent.Unverified -> emitEvent(
+                "farewell_unverified",
+                mapOf(
+                    "turnId" to event.turnId,
+                    "nativeGeneration" to event.nativeGeneration,
+                    "reason" to event.reason,
+                ),
+            )
+        }
+    }
+
     private fun emitCapturedAudio(bytes: ByteArray) {
         val sink = capturedAudioSink ?: return
         mainHandler.post {
@@ -709,6 +833,61 @@ class MindbendGeminiLiveAudioPlugin :
     private companion object {
         const val CAPTURE_SAMPLE_RATE_HZ = 16_000
         const val PLAYBACK_SAMPLE_RATE_HZ = 24_000
+        /** Attributed farewell playback API. 2 = farewellBegin/Push/End/Cancel + typed drain events. */
+        const val FAREWELL_API_VERSION = 2
+        const val FAREWELL_POLL_MS = 10L
+    }
+}
+
+/**
+ * Real AudioTrack seam for [FarewellPlaybackBarrier]. Every call goes through the playback lifetime,
+ * so a retired track is never touched again: a retired or throwing write reads as a write error and
+ * a retired track reads as idle (no timestamp, not playing), which fails an open farewell closed.
+ */
+internal class LifetimeAudioTrackPort(
+    private val track: AudioTrack,
+    private val lifetime: RetiringPlaybackLifetime,
+) : FarewellTrackPort {
+    private val timestamp = AudioTimestamp()
+    override val sampleRate: Int = track.sampleRate
+
+    override fun write(pcm: ByteArray, offset: Int, size: Int): Int =
+        try {
+            lifetime.boundary { track.write(pcm, offset, size, AudioTrack.WRITE_BLOCKING) } ?: WRITE_RETIRED
+        } catch (_: Throwable) {
+            WRITE_THREW
+        }
+
+    override fun playbackHeadPosition(): Int =
+        if (lifetime.isRetired()) 0 else try { track.playbackHeadPosition } catch (_: Throwable) { 0 }
+
+    override fun timestamp(): FarewellTrackTimestamp? {
+        if (lifetime.isRetired()) return null
+        return try {
+            synchronized(timestamp) {
+                if (track.getTimestamp(timestamp)) FarewellTrackTimestamp(timestamp.framePosition, timestamp.nanoTime) else null
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    override fun isPlaying(): Boolean =
+        !lifetime.isRetired() && try { track.playState == AudioTrack.PLAYSTATE_PLAYING } catch (_: Throwable) { false }
+
+    override fun routedDeviceId(): Int = try { track.routedDevice?.id ?: -1 } catch (_: Throwable) { -1 }
+
+    override fun pause() { lifetime.boundary { track.pause() } }
+
+    override fun flush() { lifetime.boundary { track.flush() } }
+
+    override fun stop() { lifetime.boundary { track.stop() } }
+
+    override fun play() { lifetime.boundary { track.play() } }
+
+    private companion object {
+        const val WRITE_RETIRED = -100_001
+        const val WRITE_THREW = -100_002
     }
 }
 
