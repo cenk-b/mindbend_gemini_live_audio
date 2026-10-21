@@ -42,6 +42,27 @@ abstract class MindbendGeminiLiveAudioPlatform extends PlatformInterface {
     );
   }
 
+  Future<FarewellDrainStatus> beginFarewellDrain({required int expectedFrames}) {
+    throw UnimplementedError('beginFarewellDrain() has not been implemented.');
+  }
+
+  Future<FarewellDrainStatus> cancelFarewellDrain() {
+    throw UnimplementedError('cancelFarewellDrain() has not been implemented.');
+  }
+
+  Future<FarewellDrainStatus> noteFarewellAnchor({
+    required int seq,
+    required int framesPlayed,
+    required int generation,
+    required bool nativeDrained,
+  }) {
+    throw UnimplementedError('noteFarewellAnchor() has not been implemented.');
+  }
+
+  Future<FarewellDrainStatus> farewellDrainStatus() {
+    throw UnimplementedError('farewellDrainStatus() has not been implemented.');
+  }
+
   Future<void> setDebugOptions(GeminiLiveAudioDebugOptions options) {
     throw UnimplementedError('setDebugOptions() has not been implemented.');
   }

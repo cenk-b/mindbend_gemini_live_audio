@@ -69,6 +69,51 @@ class MethodChannelMindbendGeminiLiveAudio
     return methodChannel.invokeMethod<void>('markPlaybackComplete');
   }
 
+  Future<FarewellDrainStatus> _status(String method, [Object? arguments]) async {
+    final raw = await methodChannel.invokeMethod<Object?>(method, arguments);
+    if (raw is Map) return FarewellDrainStatus.fromMap(raw);
+    return const FarewellDrainStatus(
+      generation: 0,
+      state: 'idle',
+      evidence: 'none',
+      framesPlayed: 0,
+      lastSeq: -1,
+      restartBlocked: false,
+    );
+  }
+
+  @override
+  Future<FarewellDrainStatus> beginFarewellDrain({required int expectedFrames}) {
+    return _status('beginFarewellDrain', <String, Object?>{
+      'expectedFrames': expectedFrames,
+    });
+  }
+
+  @override
+  Future<FarewellDrainStatus> cancelFarewellDrain() {
+    return _status('cancelFarewellDrain');
+  }
+
+  @override
+  Future<FarewellDrainStatus> noteFarewellAnchor({
+    required int seq,
+    required int framesPlayed,
+    required int generation,
+    required bool nativeDrained,
+  }) {
+    return _status('noteFarewellAnchor', <String, Object?>{
+      'seq': seq,
+      'framesPlayed': framesPlayed,
+      'generation': generation,
+      'nativeDrained': nativeDrained,
+    });
+  }
+
+  @override
+  Future<FarewellDrainStatus> farewellDrainStatus() {
+    return _status('farewellDrainStatus');
+  }
+
   @override
   Future<void> setDebugOptions(GeminiLiveAudioDebugOptions options) {
     return methodChannel.invokeMethod<void>('setDebugOptions', options.toMap());

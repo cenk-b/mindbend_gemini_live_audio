@@ -41,6 +41,7 @@ class MindbendGeminiLiveAudioPlugin :
     private val playbackExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val isSessionRunning = AtomicBoolean(false)
     private val playbackGeneration = AtomicLong(0)
+    private val farewellDrain = FarewellDrainGate()
 
     private var capturedAudioSink: EventChannel.EventSink? = null
     private var eventSink: EventChannel.EventSink? = null
@@ -186,6 +187,21 @@ class MindbendGeminiLiveAudioPlugin :
                 markPlaybackCompleteInternal()
                 result.success(null)
             }
+            "beginFarewellDrain" -> {
+                val frames = (call.argument<Number>("expectedFrames"))?.toInt() ?: 0
+                result.success(farewellDrain.begin(frames))
+            }
+            "cancelFarewellDrain" -> result.success(farewellDrain.cancel())
+            "noteFarewellAnchor" -> {
+                val seq = call.argument<Number>("seq")?.toInt() ?: -1
+                val framesPlayed = call.argument<Number>("framesPlayed")?.toInt() ?: 0
+                val generation = call.argument<Number>("generation")?.toLong() ?: -1L
+                val nativeDrained = call.argument<Boolean>("nativeDrained") ?: false
+                result.success(
+                    farewellDrain.noteAnchor(seq, framesPlayed, generation, nativeDrained),
+                )
+            }
+            "farewellDrainStatus" -> result.success(farewellDrain.status())
             "setDebugOptions" -> {
                 val args = call.arguments as? Map<*, *>
                 disableNoiseSuppressor = args?.get("disableNoiseSuppressor") as? Boolean ?: false
@@ -216,6 +232,7 @@ class MindbendGeminiLiveAudioPlugin :
             )
         }
 
+        farewellDrain.resetForNewSession()
         try {
             audioManager = applicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             previousAudioMode = audioManager?.mode
@@ -507,6 +524,7 @@ class MindbendGeminiLiveAudioPlugin :
     }
 
     private fun flushPlaybackInternal() {
+        farewellDrain.noteFlush()
         if (!isSessionRunning.get()) return
         val nextGeneration = playbackGeneration.incrementAndGet()
         playbackExecutor.execute {
@@ -529,12 +547,13 @@ class MindbendGeminiLiveAudioPlugin :
 
     @Synchronized
     private fun markPlaybackCompleteInternal() {
-        // Native playback completion is inferred from chunk idle timing in Dart.
-        // Do not flush or stop queued audio here.
+        // A command acknowledgement is not a native drain.
+        farewellDrain.acknowledgeCommand(farewellDrain.generation)
     }
 
     @Synchronized
     private fun stopSessionInternal(restoreAudioState: Boolean) {
+        farewellDrain.cancel()
         isSessionRunning.set(false)
         playbackGeneration.incrementAndGet()
         playbackStarted = false
@@ -639,5 +658,101 @@ class MindbendGeminiLiveAudioPlugin :
     private companion object {
         const val CAPTURE_SAMPLE_RATE_HZ = 16_000
         const val PLAYBACK_SAMPLE_RATE_HZ = 24_000
+    }
+}
+
+/**
+ * Ack is not a drain. A flush or a stale generation cannot become native_drain.
+ * The near-end window is 32 frames: a native report further out is not playback proof.
+ * No Android dependencies, so the JVM unit test can execute it.
+ */
+class FarewellDrainGate {
+    var generation: Long = 0
+        private set
+    var state: String = "idle"
+        private set
+    var evidence: String = "none"
+        private set
+    var framesPlayed: Int = 0
+        private set
+    var lastSeq: Int = -1
+        private set
+    var restartBlocked: Boolean = false
+        private set
+    private var expectedFrames: Int = 0
+
+    fun begin(expectedFrames: Int): Map<String, Any?> {
+        generation += 1
+        state = "armed"
+        evidence = "none"
+        framesPlayed = 0
+        lastSeq = -1
+        restartBlocked = false
+        this.expectedFrames = expectedFrames.coerceAtLeast(0)
+        return status()
+    }
+
+    fun noteAnchor(seq: Int, played: Int, generationAtAnchor: Long, nativeDrained: Boolean): Map<String, Any?> {
+        if (generationAtAnchor != generation || state != "armed") return status()
+        framesPlayed = played.coerceAtLeast(0)
+        lastSeq = seq
+        if (!nativeDrained) {
+            evidence = "none"
+            return status()
+        }
+        val remaining = expectedFrames - framesPlayed
+        val insideNearEnd = expectedFrames > 0 && framesPlayed > 0 && remaining <= NEAR_END_FRAMES
+        if (!insideNearEnd) {
+            evidence = "none"
+            return status()
+        }
+        state = "drained"
+        evidence = "native_drain"
+        return status()
+    }
+
+    fun acknowledgeCommand(generationAtAck: Long): Map<String, Any?> {
+        if (generationAtAck != generation || state != "armed") return status()
+        evidence = "command_ack"
+        return status()
+    }
+
+    fun noteFlush(): Map<String, Any?> {
+        if (state == "armed" || state == "drained") state = "flushed"
+        evidence = "none"
+        generation += 1
+        return status()
+    }
+
+    fun cancel(): Map<String, Any?> {
+        generation += 1
+        state = "cancelled"
+        evidence = "none"
+        restartBlocked = true
+        return status()
+    }
+
+    fun resetForNewSession(): Map<String, Any?> {
+        generation += 1
+        state = "idle"
+        evidence = "none"
+        framesPlayed = 0
+        lastSeq = -1
+        expectedFrames = 0
+        restartBlocked = false
+        return status()
+    }
+
+    fun status(): Map<String, Any?> = mapOf(
+        "generation" to generation,
+        "state" to state,
+        "evidence" to evidence,
+        "framesPlayed" to framesPlayed,
+        "lastSeq" to lastSeq,
+        "restartBlocked" to restartBlocked,
+    )
+
+    companion object {
+        const val NEAR_END_FRAMES = 32
     }
 }

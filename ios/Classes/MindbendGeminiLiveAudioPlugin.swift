@@ -22,8 +22,93 @@ private final class ClosureStreamHandler: NSObject, FlutterStreamHandler {
   }
 }
 
+struct FarewellDrainGate {
+  static let nearEndFrames = 32
+  private(set) var generation = 0
+  private(set) var state = "idle"
+  private(set) var evidence = "none"
+  private(set) var framesPlayed = 0
+  private(set) var lastSeq = -1
+  private(set) var restartBlocked = false
+  private var expectedFrames = 0
+
+  mutating func begin(expectedFrames: Int) -> [String: Any] {
+    generation += 1
+    state = "armed"
+    evidence = "none"
+    framesPlayed = 0
+    lastSeq = -1
+    restartBlocked = false
+    self.expectedFrames = max(0, expectedFrames)
+    return status()
+  }
+
+  mutating func noteAnchor(seq: Int, played: Int, generationAtAnchor: Int, nativeDrained: Bool) -> [String: Any] {
+    if generationAtAnchor != generation || state != "armed" { return status() }
+    framesPlayed = max(0, played)
+    lastSeq = seq
+    if !nativeDrained {
+      evidence = "none"
+      return status()
+    }
+    let remaining = expectedFrames - framesPlayed
+    let insideNearEnd = expectedFrames > 0 && framesPlayed > 0 && remaining <= FarewellDrainGate.nearEndFrames
+    if !insideNearEnd {
+      evidence = "none"
+      return status()
+    }
+    state = "drained"
+    evidence = "native_drain"
+    return status()
+  }
+
+  mutating func acknowledgeCommand(generationAtAck: Int) -> [String: Any] {
+    if generationAtAck != generation || state != "armed" { return status() }
+    evidence = "command_ack"
+    return status()
+  }
+
+  mutating func noteFlush() -> [String: Any] {
+    if state == "armed" || state == "drained" { state = "flushed" }
+    evidence = "none"
+    generation += 1
+    return status()
+  }
+
+  mutating func cancel() -> [String: Any] {
+    generation += 1
+    state = "cancelled"
+    evidence = "none"
+    restartBlocked = true
+    return status()
+  }
+
+  mutating func resetForNewSession() -> [String: Any] {
+    generation += 1
+    state = "idle"
+    evidence = "none"
+    framesPlayed = 0
+    lastSeq = -1
+    expectedFrames = 0
+    restartBlocked = false
+    return status()
+  }
+
+  func status() -> [String: Any] {
+    [
+      "generation": generation,
+      "state": state,
+      "evidence": evidence,
+      "framesPlayed": framesPlayed,
+      "lastSeq": lastSeq,
+      "restartBlocked": restartBlocked,
+    ]
+  }
+}
+
 public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   private let sessionQueue = DispatchQueue(label: "com.cognistence.mindbend_gemini_live_audio.session")
+  private var farewellDrain = FarewellDrainGate()
   private let audioSession = AVAudioSession.sharedInstance()
 
   private var captureStreamHandler: ClosureStreamHandler?
@@ -172,6 +257,41 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
           result(nil)
         }
       }
+    case "beginFarewellDrain":
+      let frames = (call.arguments as? [String: Any])?["expectedFrames"] as? Int ?? 0
+      sessionQueue.async { [weak self] in
+        guard let self else { return }
+        let payload = self.farewellDrain.begin(expectedFrames: frames)
+        DispatchQueue.main.async { result(payload) }
+      }
+    case "cancelFarewellDrain":
+      sessionQueue.async { [weak self] in
+        guard let self else { return }
+        let payload = self.farewellDrain.cancel()
+        DispatchQueue.main.async { result(payload) }
+      }
+    case "noteFarewellAnchor":
+      let args = call.arguments as? [String: Any]
+      let seq = args?["seq"] as? Int ?? -1
+      let played = args?["framesPlayed"] as? Int ?? 0
+      let generation = args?["generation"] as? Int ?? -1
+      let nativeDrained = args?["nativeDrained"] as? Bool ?? false
+      sessionQueue.async { [weak self] in
+        guard let self else { return }
+        let payload = self.farewellDrain.noteAnchor(
+          seq: seq,
+          played: played,
+          generationAtAnchor: generation,
+          nativeDrained: nativeDrained
+        )
+        DispatchQueue.main.async { result(payload) }
+      }
+    case "farewellDrainStatus":
+      sessionQueue.async { [weak self] in
+        guard let self else { return }
+        let payload = self.farewellDrain.status()
+        DispatchQueue.main.async { result(payload) }
+      }
     case "setDebugOptions":
       result(nil)
     default:
@@ -202,6 +322,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     }
 
     do {
+      _ = farewellDrain.resetForNewSession()
       previousCategory = audioSession.category
       previousMode = audioSession.mode
       previousOptions = audioSession.categoryOptions
@@ -854,7 +975,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         if !audioEngine.isRunning {
           try audioEngine.start()
         }
-        if !player.isPlaying {
+        if !player.isPlaying && !farewellDrain.restartBlocked {
           player.play()
         }
       } catch {
@@ -1163,6 +1284,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   }
 
   private func flushPlaybackLocked() {
+    _ = farewellDrain.noteFlush()
     reprimePlaybackLocked(reason: "flush_request", emitInterruption: true)
   }
 
@@ -1184,7 +1306,9 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     }
     player.stop()
     player.reset()
-    player.play()
+    if !farewellDrain.restartBlocked {
+      player.play()
+    }
     playbackDidStart = false
     pendingPlaybackBufferCount = 0
     mixerBufferCount = 0
@@ -1211,11 +1335,11 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   }
 
   private func markPlaybackCompleteLocked() {
-    // Native playback completion is inferred from chunk idle timing in Dart.
-    // This method intentionally does not flush or stop queued audio.
+    _ = farewellDrain.acknowledgeCommand(generationAtAck: farewellDrain.generation)
   }
 
   private func stopSessionLocked(restoreAudioSession: Bool) {
+    _ = farewellDrain.cancel()
     if let inputNode = engine?.inputNode {
       inputNode.removeTap(onBus: 0)
     }

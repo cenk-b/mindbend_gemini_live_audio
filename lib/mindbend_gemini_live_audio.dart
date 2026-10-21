@@ -156,6 +156,38 @@ class GeminiLiveAudioDebugOptions {
   };
 }
 
+class FarewellDrainStatus {
+  const FarewellDrainStatus({
+    required this.generation,
+    required this.state,
+    required this.evidence,
+    required this.framesPlayed,
+    required this.lastSeq,
+    required this.restartBlocked,
+  });
+
+  final int generation;
+  final String state;
+  final String evidence;
+  final int framesPlayed;
+  final int lastSeq;
+  final bool restartBlocked;
+
+  bool get isNativeDrain => evidence == 'native_drain';
+
+  factory FarewellDrainStatus.fromMap(Map<Object?, Object?> raw) {
+    int asInt(Object? value) => value is int ? value : (value is num ? value.toInt() : 0);
+    return FarewellDrainStatus(
+      generation: asInt(raw['generation']),
+      state: raw['state'] is String ? raw['state'] as String : 'idle',
+      evidence: raw['evidence'] is String ? raw['evidence'] as String : 'none',
+      framesPlayed: asInt(raw['framesPlayed']),
+      lastSeq: asInt(raw['lastSeq']),
+      restartBlocked: raw['restartBlocked'] == true,
+    );
+  }
+}
+
 class MindbendGeminiLiveAudio {
   Future<GeminiLiveAudioStartResult> startSession() {
     return MindbendGeminiLiveAudioPlatform.instance.startSession();
@@ -177,6 +209,34 @@ class MindbendGeminiLiveAudio {
 
   Future<void> markPlaybackComplete() {
     return MindbendGeminiLiveAudioPlatform.instance.markPlaybackComplete();
+  }
+
+  Future<FarewellDrainStatus> beginFarewellDrain({required int expectedFrames}) {
+    return MindbendGeminiLiveAudioPlatform.instance.beginFarewellDrain(
+      expectedFrames: expectedFrames,
+    );
+  }
+
+  Future<FarewellDrainStatus> cancelFarewellDrain() {
+    return MindbendGeminiLiveAudioPlatform.instance.cancelFarewellDrain();
+  }
+
+  Future<FarewellDrainStatus> noteFarewellAnchor({
+    required int seq,
+    required int framesPlayed,
+    required int generation,
+    required bool nativeDrained,
+  }) {
+    return MindbendGeminiLiveAudioPlatform.instance.noteFarewellAnchor(
+      seq: seq,
+      framesPlayed: framesPlayed,
+      generation: generation,
+      nativeDrained: nativeDrained,
+    );
+  }
+
+  Future<FarewellDrainStatus> farewellDrainStatus() {
+    return MindbendGeminiLiveAudioPlatform.instance.farewellDrainStatus();
   }
 
   Future<void> setDebugOptions(GeminiLiveAudioDebugOptions options) {
