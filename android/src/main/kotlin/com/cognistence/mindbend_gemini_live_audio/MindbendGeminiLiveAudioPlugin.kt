@@ -41,7 +41,10 @@ class MindbendGeminiLiveAudioPlugin :
     private val playbackExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val isSessionRunning = AtomicBoolean(false)
     private val playbackGeneration = AtomicLong(0)
+    private val sessionControlGeneration = AtomicLong(0)
+    private val sessionExecutor = Executors.newSingleThreadExecutor()
     private val farewellDrain = FarewellDrainGate()
+    @Volatile private var playbackLifetime: RetiringPlaybackLifetime? = null
 
     private var capturedAudioSink: EventChannel.EventSink? = null
     private var eventSink: EventChannel.EventSink? = null
@@ -165,10 +168,20 @@ class MindbendGeminiLiveAudioPlugin :
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
-            "startSession" -> result.success(startSession())
+            "startSession" -> {
+                val requestGeneration = sessionControlGeneration.get()
+                sessionExecutor.execute {
+                    val payload = startSession(requestGeneration)
+                    mainHandler.post { result.success(payload) }
+                }
+            }
             "stopSession" -> {
-                stopSessionInternal(restoreAudioState = true)
-                result.success(null)
+                sessionControlGeneration.incrementAndGet()
+                playbackLifetime?.cancel()
+                sessionExecutor.execute {
+                    stopSessionInternal(restoreAudioState = true)
+                    mainHandler.post { result.success(null) }
+                }
             }
             "pushPlaybackPcm" -> {
                 val bytes = call.arguments as? ByteArray
@@ -191,12 +204,22 @@ class MindbendGeminiLiveAudioPlugin :
                 val frames = (call.argument<Number>("expectedFrames"))?.toInt() ?: 0
                 result.success(farewellDrain.begin(frames))
             }
-            "cancelFarewellDrain" -> result.success(farewellDrain.cancel())
+            "cancelFarewellDrain" -> {
+                sessionControlGeneration.incrementAndGet()
+                val status = farewellDrain.cancel()
+                playbackGeneration.incrementAndGet()
+                val lifetime = playbackLifetime
+                val pending = lifetime?.cancel()
+                if (pending == null) result.success(status + mapOf("teardown" to "no_player"))
+                else pending.thenAccept { state -> mainHandler.post {
+                    result.success(status + mapOf("teardown" to state))
+                } }
+            }
             "noteFarewellAnchor" -> {
                 val seq = call.argument<Number>("seq")?.toInt() ?: -1
                 val framesPlayed = call.argument<Number>("framesPlayed")?.toInt() ?: 0
                 val generation = call.argument<Number>("generation")?.toLong() ?: -1L
-                val nativeDrained = call.argument<Boolean>("nativeDrained") ?: false
+                val nativeDrained = false // caller-supplied booleans are never native evidence
                 result.success(
                     farewellDrain.noteAnchor(seq, framesPlayed, generation, nativeDrained),
                 )
@@ -218,10 +241,15 @@ class MindbendGeminiLiveAudioPlugin :
         capturedAudioChannel.setStreamHandler(null)
         eventChannel.setStreamHandler(null)
         playbackExecutor.shutdownNow()
+        sessionExecutor.shutdown()
     }
 
     @Synchronized
-    private fun startSession(): Map<String, Any?> {
+    private fun startSession(requestGeneration: Long): Map<String, Any?> {
+        if (requestGeneration != sessionControlGeneration.get()) return fallbackResult("session_start_cancelled")
+        if (isSessionRunning.get() && playbackLifetime?.isRetired() == true) {
+            stopSessionInternal(restoreAudioState = false)
+        }
         if (isSessionRunning.get()) {
             return startResult(
                 aecActive = true,
@@ -322,6 +350,17 @@ class MindbendGeminiLiveAudioPlugin :
 
             audioRecord = record
             audioTrack = track
+            playbackLifetime = RetiringPlaybackLifetime(
+                stop = {
+                    // Each action is attempted even if another fails.
+                    var failure: Throwable? = null
+                    try { track.pause() } catch (t: Throwable) { failure = t }
+                    try { track.flush() } catch (t: Throwable) { failure = t }
+                    try { track.stop() } catch (t: Throwable) { failure = t }
+                    failure?.let { throw it }
+                },
+                release = { track.release() },
+            )
             acousticEchoCanceler = echoCanceler
             noiseSuppressor = ns
             automaticGainControl = agc
@@ -330,7 +369,21 @@ class MindbendGeminiLiveAudioPlugin :
             isSessionRunning.set(true)
             playbackGeneration.incrementAndGet()
 
-            track.play()
+            val lifetime = playbackLifetime!!
+            if (requestGeneration != sessionControlGeneration.get()) {
+                lifetime.cancel()
+                stopSessionInternal(restoreAudioState = true)
+                return fallbackResult("session_start_cancelled")
+            }
+            if (lifetime.boundary { track.play() } == null) {
+                stopSessionInternal(restoreAudioState = true)
+                return fallbackResult("session_start_cancelled")
+            }
+            if (requestGeneration != sessionControlGeneration.get()) {
+                lifetime.cancel()
+                stopSessionInternal(restoreAudioState = true)
+                return fallbackResult("session_start_cancelled")
+            }
             record.startRecording()
             startCaptureLoop(captureBufferSize)
             emitEvent(
@@ -493,11 +546,12 @@ class MindbendGeminiLiveAudioPlugin :
             return
         }
         val generationAtEnqueue = playbackGeneration.get()
-        playbackExecutor.execute {
+        val lifetime = playbackLifetime ?: return
+        lifetime.submit {
             if (!isSessionRunning.get() || generationAtEnqueue != playbackGeneration.get()) {
-                return@execute
+                return@submit
             }
-            val track = audioTrack ?: return@execute
+            val track = audioTrack ?: return@submit
             if (!playbackStarted) {
                 playbackStarted = true
                 emitEvent(
@@ -508,15 +562,15 @@ class MindbendGeminiLiveAudioPlugin :
             var offset = 0
             while (offset < bytes.size && isSessionRunning.get()) {
                 if (generationAtEnqueue != playbackGeneration.get()) {
-                    return@execute
+                    return@submit
                 }
-                val written = track.write(bytes, offset, bytes.size - offset, AudioTrack.WRITE_BLOCKING)
+                val written = lifetime.boundary { track.write(bytes, offset, bytes.size - offset, AudioTrack.WRITE_BLOCKING) } ?: return@submit
                 if (written <= 0) {
                     if (generationAtEnqueue != playbackGeneration.get()) {
-                        return@execute
+                        return@submit
                     }
                     emitEvent("error", mapOf("code" to "android_playback_write_$written"))
-                    return@execute
+                    return@submit
                 }
                 offset += written
             }
@@ -527,15 +581,16 @@ class MindbendGeminiLiveAudioPlugin :
         farewellDrain.noteFlush()
         if (!isSessionRunning.get()) return
         val nextGeneration = playbackGeneration.incrementAndGet()
-        playbackExecutor.execute {
+        val lifetime = playbackLifetime ?: return
+        lifetime.submit {
             if (!isSessionRunning.get() || nextGeneration != playbackGeneration.get()) {
-                return@execute
+                return@submit
             }
-            val track = audioTrack ?: return@execute
+            val track = audioTrack ?: return@submit
             try {
-                track.pause()
-                track.flush()
-                track.play()
+                lifetime.boundary { track.pause() } ?: return@submit
+                lifetime.boundary { track.flush() } ?: return@submit
+                lifetime.boundary { track.play() } ?: return@submit
                 playbackStarted = false
                 emitEvent("interrupted", mapOf("route" to currentRouteDescription()))
                 emitEvent("playback_stopped", mapOf("route" to currentRouteDescription()))
@@ -554,6 +609,7 @@ class MindbendGeminiLiveAudioPlugin :
     @Synchronized
     private fun stopSessionInternal(restoreAudioState: Boolean) {
         farewellDrain.cancel()
+        playbackLifetime?.cancel()
         isSessionRunning.set(false)
         playbackGeneration.incrementAndGet()
         playbackStarted = false
@@ -568,13 +624,8 @@ class MindbendGeminiLiveAudioPlugin :
         audioRecord?.release()
         audioRecord = null
 
-        try {
-            audioTrack?.pause()
-            audioTrack?.flush()
-            audioTrack?.stop()
-        } catch (_: Throwable) {
-        }
-        audioTrack?.release()
+        playbackLifetime?.cancel()
+        playbackLifetime = null
         audioTrack = null
 
         acousticEchoCanceler?.release()
@@ -681,7 +732,9 @@ class FarewellDrainGate {
         private set
     private var expectedFrames: Int = 0
 
+    @Synchronized
     fun begin(expectedFrames: Int): Map<String, Any?> {
+        if (restartBlocked) return status()
         generation += 1
         state = "armed"
         evidence = "none"
@@ -692,6 +745,7 @@ class FarewellDrainGate {
         return status()
     }
 
+    @Synchronized
     fun noteAnchor(seq: Int, played: Int, generationAtAnchor: Long, nativeDrained: Boolean): Map<String, Any?> {
         if (generationAtAnchor != generation || state != "armed") return status()
         framesPlayed = played.coerceAtLeast(0)
@@ -711,12 +765,14 @@ class FarewellDrainGate {
         return status()
     }
 
+    @Synchronized
     fun acknowledgeCommand(generationAtAck: Long): Map<String, Any?> {
         if (generationAtAck != generation || state != "armed") return status()
         evidence = "command_ack"
         return status()
     }
 
+    @Synchronized
     fun noteFlush(): Map<String, Any?> {
         if (state == "armed" || state == "drained") state = "flushed"
         evidence = "none"
@@ -724,6 +780,7 @@ class FarewellDrainGate {
         return status()
     }
 
+    @Synchronized
     fun cancel(): Map<String, Any?> {
         generation += 1
         state = "cancelled"
@@ -732,6 +789,7 @@ class FarewellDrainGate {
         return status()
     }
 
+    @Synchronized
     fun resetForNewSession(): Map<String, Any?> {
         generation += 1
         state = "idle"
@@ -743,6 +801,7 @@ class FarewellDrainGate {
         return status()
     }
 
+    @Synchronized
     fun status(): Map<String, Any?> = mapOf(
         "generation" to generation,
         "state" to state,

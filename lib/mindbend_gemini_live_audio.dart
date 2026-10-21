@@ -164,6 +164,7 @@ class FarewellDrainStatus {
     required this.framesPlayed,
     required this.lastSeq,
     required this.restartBlocked,
+    this.teardown = 'not_requested',
   });
 
   final int generation;
@@ -172,6 +173,9 @@ class FarewellDrainStatus {
   final int framesPlayed;
   final int lastSeq;
   final bool restartBlocked;
+
+  /// Native calls returned or failed; never acoustic silence or data quiescence.
+  final String teardown;
 
   bool get isNativeDrain => evidence == 'native_drain';
 
@@ -184,6 +188,7 @@ class FarewellDrainStatus {
       framesPlayed: asInt(raw['framesPlayed']),
       lastSeq: asInt(raw['lastSeq']),
       restartBlocked: raw['restartBlocked'] == true,
+      teardown: raw['teardown'] is String ? raw['teardown'] as String : 'not_requested',
     );
   }
 }
