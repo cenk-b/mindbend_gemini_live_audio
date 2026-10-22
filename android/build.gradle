@@ -49,12 +49,14 @@ android {
 
     dependencies {
         testImplementation("org.jetbrains.kotlin:kotlin-test")
+        // The lab barrier suites are JUnit 4 (org.junit.Test); run everything on the JUnit 4 runner.
+        testImplementation("junit:junit:4.12")
         testImplementation("org.mockito:mockito-core:5.0.0")
     }
 
     testOptions {
         unitTests.all {
-            useJUnitPlatform()
+            useJUnit()
 
             testLogging {
                events "passed", "skipped", "failed", "standardOut", "standardError"

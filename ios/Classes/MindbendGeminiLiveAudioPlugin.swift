@@ -22,8 +22,116 @@ private final class ClosureStreamHandler: NSObject, FlutterStreamHandler {
   }
 }
 
+struct FarewellDrainGate {
+  static let nearEndFrames = 32
+  private(set) var generation = 0
+  private(set) var state = "idle"
+  private(set) var evidence = "none"
+  private(set) var framesPlayed = 0
+  private(set) var lastSeq = -1
+  private(set) var restartBlocked = false
+  private var expectedFrames = 0
+
+  mutating func begin(expectedFrames: Int) -> [String: Any] {
+    if restartBlocked { return status() }
+    generation += 1
+    state = "armed"
+    evidence = "none"
+    framesPlayed = 0
+    lastSeq = -1
+    restartBlocked = false
+    self.expectedFrames = max(0, expectedFrames)
+    return status()
+  }
+
+  mutating func noteAnchor(seq: Int, played: Int, generationAtAnchor: Int, nativeDrained: Bool) -> [String: Any] {
+    if generationAtAnchor != generation || state != "armed" { return status() }
+    framesPlayed = max(0, played)
+    lastSeq = seq
+    if !nativeDrained {
+      evidence = "none"
+      return status()
+    }
+    let remaining = expectedFrames - framesPlayed
+    let insideNearEnd = expectedFrames > 0 && framesPlayed > 0 && remaining <= FarewellDrainGate.nearEndFrames
+    if !insideNearEnd {
+      evidence = "none"
+      return status()
+    }
+    state = "drained"
+    evidence = "native_drain"
+    return status()
+  }
+
+  mutating func acknowledgeCommand(generationAtAck: Int) -> [String: Any] {
+    if generationAtAck != generation || state != "armed" { return status() }
+    evidence = "command_ack"
+    return status()
+  }
+
+  mutating func noteFlush() -> [String: Any] {
+    if state == "armed" || state == "drained" { state = "flushed" }
+    evidence = "none"
+    generation += 1
+    return status()
+  }
+
+  mutating func cancel() -> [String: Any] {
+    generation += 1
+    state = "cancelled"
+    evidence = "none"
+    restartBlocked = true
+    return status()
+  }
+
+  mutating func resetForNewSession() -> [String: Any] {
+    generation += 1
+    state = "idle"
+    evidence = "none"
+    framesPlayed = 0
+    lastSeq = -1
+    expectedFrames = 0
+    restartBlocked = false
+    return status()
+  }
+
+  func status() -> [String: Any] {
+    [
+      "generation": generation,
+      "state": state,
+      "evidence": evidence,
+      "framesPlayed": framesPlayed,
+      "lastSeq": lastSeq,
+      "restartBlocked": restartBlocked,
+    ]
+  }
+}
+
 public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   private let sessionQueue = DispatchQueue(label: "com.cognistence.mindbend_gemini_live_audio.session")
+  private var farewellDrain = FarewellDrainGate()
+  private let lifetimeLock = NSLock()
+  private var controlGeneration = 0
+  private func captureControlGeneration() -> Int {
+    lifetimeLock.lock(); defer { lifetimeLock.unlock() }; return controlGeneration
+  }
+  private func invalidatePendingStart() {
+    lifetimeLock.lock(); controlGeneration += 1; lifetimeLock.unlock()
+  }
+  private var _playbackLifetime: RetiringPlaybackLifetime?
+  private var playbackLifetime: RetiringPlaybackLifetime? {
+    get { lifetimeLock.lock(); defer { lifetimeLock.unlock() }; return _playbackLifetime }
+    set { lifetimeLock.lock(); _playbackLifetime = newValue; lifetimeLock.unlock() }
+  }
+  /// One barrier per playback lifetime. Read from the platform thread by the cancel path.
+  private var _farewellBarrier: FarewellPlaybackBarrier?
+  private var farewellBarrier: FarewellPlaybackBarrier? {
+    get { lifetimeLock.lock(); defer { lifetimeLock.unlock() }; return _farewellBarrier }
+    set { lifetimeLock.lock(); _farewellBarrier = newValue; lifetimeLock.unlock() }
+  }
+  private var engineConfigurationObserver: NSObjectProtocol?
+  /// Attributed farewell playback API. 2 = farewellBegin/Push/End/Cancel + typed drain events.
+  private static let farewellApiVersion = 2
   private let audioSession = AVAudioSession.sharedInstance()
 
   private var captureStreamHandler: ClosureStreamHandler?
@@ -115,14 +223,18 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
     case "startSession":
+      let requestGeneration = captureControlGeneration()
       sessionQueue.async { [weak self] in
         guard let self else { return }
-        let payload = self.startSessionLocked()
+        let payload = self.startSessionLocked(requestGeneration: requestGeneration)
         DispatchQueue.main.async {
           result(payload)
         }
       }
     case "stopSession":
+      invalidatePendingStart()
+      farewellBarrier?.invalidateAsync(reason: "session_stopped")
+      playbackLifetime?.cancel()
       sessionQueue.async { [weak self] in
         self?.stopSessionLocked(restoreAudioSession: true)
         DispatchQueue.main.async {
@@ -172,6 +284,109 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
           result(nil)
         }
       }
+    case "beginFarewellDrain":
+      let frames = (call.arguments as? [String: Any])?["expectedFrames"] as? Int ?? 0
+      sessionQueue.async { [weak self] in
+        guard let self else { return }
+        let payload = self.farewellDrain.begin(expectedFrames: frames)
+        DispatchQueue.main.async { result(payload) }
+      }
+    case "cancelFarewellDrain":
+      invalidatePendingStart()
+      // The platform handler never waits on sessionQueue (which may be parked in schedule/play).
+      farewellBarrier?.invalidateAsync(reason: "playback_cancelled")
+      let lifetime = playbackLifetime
+      lifetime?.cancel { state in
+        DispatchQueue.main.async {
+          result(["state": "cancelled", "evidence": "none", "restartBlocked": true,
+                  "generation": -1, "teardown": state])
+        }
+      }
+      if lifetime == nil {
+        result(["state": "cancelled", "evidence": "none", "restartBlocked": true,
+                "generation": -1, "teardown": "no_player"])
+      }
+      sessionQueue.async { [weak self] in _ = self?.farewellDrain.cancel() }
+    case "noteFarewellAnchor":
+      let args = call.arguments as? [String: Any]
+      let seq = args?["seq"] as? Int ?? -1
+      let played = args?["framesPlayed"] as? Int ?? 0
+      let generation = args?["generation"] as? Int ?? -1
+      let nativeDrained = false // channel input is not native drain evidence
+      sessionQueue.async { [weak self] in
+        guard let self else { return }
+        let payload = self.farewellDrain.noteAnchor(
+          seq: seq,
+          played: played,
+          generationAtAnchor: generation,
+          nativeDrained: nativeDrained
+        )
+        DispatchQueue.main.async { result(payload) }
+      }
+    case "farewellDrainStatus":
+      sessionQueue.async { [weak self] in
+        guard let self else { return }
+        let payload = self.farewellDrain.status()
+        DispatchQueue.main.async { result(payload) }
+      }
+    case "farewellCapabilities":
+      result([
+        "api": Self.farewellApiVersion,
+        "attributedDrain": true,
+        "platform": "ios",
+        "evidence": "ios_dataPlayedBack+position",
+      ])
+    case "farewellBegin":
+      let args = call.arguments as? [String: Any]
+      guard let turnId = args?["turnId"] as? String, !turnId.isEmpty,
+            let nativeGeneration = args?["nativeGeneration"] as? Int else {
+        result(["accepted": false, "reason": "invalid_arguments"])
+        return
+      }
+      sessionQueue.async { [weak self] in
+        guard let self, self.isSessionRunning, let barrier = self.farewellBarrier,
+              let lifetime = self.playbackLifetime, !lifetime.isRetired else {
+          DispatchQueue.main.async { result(["accepted": false, "reason": "no_playback"]) }
+          return
+        }
+        barrier.begin(turnId: turnId, nativeGeneration: nativeGeneration)
+        DispatchQueue.main.async { result(["accepted": true]) }
+      }
+    case "farewellPush":
+      let args = call.arguments as? [String: Any]
+      guard let turnId = args?["turnId"] as? String, !turnId.isEmpty,
+            let seq = args?["seq"] as? Int,
+            let pcm = Self.decodeBytes(args?["pcm"]) else {
+        result(false)
+        return
+      }
+      // Same serial queue as legacy audio, so the barrier sees farewell and legacy in scheduling order.
+      sessionQueue.async { [weak self] in
+        let accepted = self?.farewellBarrier?.push(turnId: turnId, seq: seq, pcm16: pcm) ?? false
+        DispatchQueue.main.async { result(accepted) }
+      }
+    case "farewellEnd":
+      let args = call.arguments as? [String: Any]
+      guard let turnId = args?["turnId"] as? String, !turnId.isEmpty,
+            let totalChunks = args?["totalChunks"] as? Int,
+            let totalFrames = (args?["totalFrames"] as? NSNumber)?.int64Value else {
+        result(false)
+        return
+      }
+      sessionQueue.async { [weak self] in
+        guard let barrier = self?.farewellBarrier else {
+          DispatchQueue.main.async { result(false) }
+          return
+        }
+        barrier.end(turnId: turnId, totalChunks: totalChunks, totalFrames: totalFrames)
+        DispatchQueue.main.async { result(true) }
+      }
+    case "farewellCancel":
+      let args = call.arguments as? [String: Any]
+      if let turnId = args?["turnId"] as? String, !turnId.isEmpty {
+        farewellBarrier?.cancel(turnId: turnId, reason: (args?["reason"] as? String) ?? "cancelled")
+      }
+      result(true)
     case "setDebugOptions":
       result(nil)
     default:
@@ -192,7 +407,13 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     return nil
   }
 
-  private func startSessionLocked() -> [String: Any] {
+  private func startSessionLocked(requestGeneration: Int) -> [String: Any] {
+    guard requestGeneration == captureControlGeneration() else {
+      return startResult(aecActive: false, transportMode: "legacy_half_duplex", errorCode: "session_start_cancelled")
+    }
+    if isSessionRunning && playbackLifetime?.isRetired == true {
+      stopSessionLocked(restoreAudioSession: false)
+    }
     if isSessionRunning {
       return startResult(
         aecActive: true,
@@ -202,6 +423,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     }
 
     do {
+      _ = farewellDrain.resetForNewSession()
       previousCategory = audioSession.category
       previousMode = audioSession.mode
       previousOptions = audioSession.categoryOptions
@@ -276,6 +498,29 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
 
       engine = audioEngine
       playerNode = player
+      let barrierBox = FarewellBarrierBox()
+      let lifetime = RetiringPlaybackLifetime(stop: {
+        // A retired player can never prove a drain. Async: this runs on the independent control queue.
+        barrierBox.barrier?.invalidateAsync(reason: "playback_retired")
+        player.stop()
+      })
+      playbackLifetime = lifetime
+      let barrier = FarewellPlaybackBarrier(
+        player: PluginFarewellPlayer(engine: audioEngine, node: player, format: outputPlaybackFormat, lifetime: lifetime),
+        emit: { [weak self] event in self?.emitFarewellEvent(event) }
+      )
+      barrierBox.barrier = barrier
+      farewellBarrier = barrier
+      engineConfigurationObserver = NotificationCenter.default.addObserver(
+        forName: .AVAudioEngineConfigurationChange, object: audioEngine, queue: nil
+      ) { [weak barrier] _ in
+        barrier?.invalidateAsync(reason: "engine_configuration_change")
+      }
+      if requestGeneration != captureControlGeneration() {
+        playbackLifetime?.cancel()
+        throw NSError(domain: "mindbend_gemini_live_audio", code: -30,
+          userInfo: [NSLocalizedDescriptionKey: "Session start cancelled."])
+      }
       captureConverter = converter
       captureTargetFormat = targetCaptureFormat
       playbackFormat = outputPlaybackFormat
@@ -854,8 +1099,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         if !audioEngine.isRunning {
           try audioEngine.start()
         }
-        if !player.isPlaying {
-          player.play()
+        if let lifetime = playbackLifetime, !lifetime.isRetired, !farewellDrain.restartBlocked {
+          _ = lifetime.boundary { player.play() }
         }
       } catch {
         lastThrownError = error
@@ -950,6 +1195,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
 
       switch type {
       case .began:
+        self.farewellBarrier?.invalidate(reason: "interrupted")
         self.emitEvent(
           "interruption_began",
           ["route": self.currentRouteDescriptionLocked()]
@@ -983,6 +1229,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
           let outputs = route.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
           return "inputs=[\(inputs)] outputs=[\(outputs)]"
         }
+      self.farewellBarrier?.invalidate(reason: "route_changed")
       self.emitEvent(
         "route_changed",
         [
@@ -1000,6 +1247,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
 
   @objc private func handleMediaServicesWereLost(_ notification: Notification) {
     sessionQueue.async { [weak self] in
+      self?.farewellBarrier?.invalidate(reason: "media_services_lost")
       self?.emitEvent("media_services_lost")
     }
   }
@@ -1007,6 +1255,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   @objc private func handleMediaServicesWereReset(_ notification: Notification) {
     sessionQueue.async { [weak self] in
       guard let self else { return }
+      self.farewellBarrier?.invalidate(reason: "media_services_reset")
       self.emitEvent("media_services_reset")
       self.recoverAudioSessionLocked(trigger: "media_services_reset")
     }
@@ -1077,6 +1326,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         userInfo: [NSLocalizedDescriptionKey: "Session is not running."]
       )
     }
+    guard let lifetime = playbackLifetime, !lifetime.isRetired else { return }
     if bytes.isEmpty {
       return
     }
@@ -1105,6 +1355,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     bytes.copyBytes(to: mData.assumingMemoryBound(to: UInt8.self), count: bytes.count)
     audioBufferList[0].mDataByteSize = UInt32(bytes.count)
 
+    // The barrier must know every buffer that lands on this player's timeline ahead of a farewell.
+    farewellBarrier?.noteLegacyScheduled(frames: Int64(frameCount))
     playbackChunkCount += 1
     playbackBytesScheduled += bytes.count
     pendingPlaybackBufferCount += 1
@@ -1114,9 +1366,10 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       playbackChunkCount <= 4 ||
       playbackChunkCount % 16 == 0
     let pcmStats = shouldEmitEnqueueSnapshot ? pcm16StatsLocked(bytes) : [:]
-    player.scheduleBuffer(pcmBuffer) { [weak self] in
+    let scheduled: Void? = lifetime.boundary { player.scheduleBuffer(pcmBuffer) { [weak self] in
       guard let self else { return }
       self.sessionQueue.async {
+        guard !lifetime.isRetired, self.playbackLifetime === lifetime else { return }
         self.pendingPlaybackBufferCount = max(0, self.pendingPlaybackBufferCount - 1)
         self.playbackCompletionCount += 1
         if self.playbackCompletionCount == 1 || self.playbackCompletionCount % 16 == 0 {
@@ -1130,8 +1383,10 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         }
       }
     }
+    }
+    guard scheduled != nil, !lifetime.isRetired else { return }
     if !player.isPlaying {
-      player.play()
+      guard lifetime.boundary({ player.play() }) != nil else { return }
     }
     if shouldEmitEnqueueSnapshot {
       var details: [String: Any?] = [
@@ -1163,6 +1418,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   }
 
   private func flushPlaybackLocked() {
+    _ = farewellDrain.noteFlush()
     reprimePlaybackLocked(reason: "flush_request", emitInterruption: true)
   }
 
@@ -1184,7 +1440,10 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     }
     player.stop()
     player.reset()
-    player.play()
+    farewellBarrier?.noteTimelineReset(reason: "playback_reprimed")
+    if let lifetime = playbackLifetime, !lifetime.isRetired, !farewellDrain.restartBlocked {
+      _ = lifetime.boundary { player.play() }
+    }
     playbackDidStart = false
     pendingPlaybackBufferCount = 0
     mixerBufferCount = 0
@@ -1211,11 +1470,18 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   }
 
   private func markPlaybackCompleteLocked() {
-    // Native playback completion is inferred from chunk idle timing in Dart.
-    // This method intentionally does not flush or stop queued audio.
+    _ = farewellDrain.acknowledgeCommand(generationAtAck: farewellDrain.generation)
   }
 
   private func stopSessionLocked(restoreAudioSession: Bool) {
+    farewellBarrier?.noteTimelineReset(reason: "session_stopped")
+    farewellBarrier = nil
+    if let observer = engineConfigurationObserver {
+      NotificationCenter.default.removeObserver(observer)
+      engineConfigurationObserver = nil
+    }
+    playbackLifetime?.cancel()
+    _ = farewellDrain.cancel()
     if let inputNode = engine?.inputNode {
       inputNode.removeTap(onBus: 0)
     }
@@ -1226,6 +1492,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     engine?.reset()
 
     playerNode = nil
+    playbackLifetime = nil
     captureConverter = nil
     captureTargetFormat = nil
     playbackFormat = nil
@@ -1262,6 +1529,26 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     }
 
     unregisterAudioSessionObserversLocked()
+  }
+
+  private func emitFarewellEvent(_ event: FarewellBarrierEvent) {
+    switch event {
+    case let .drained(turnId, nativeGeneration, drainedAtEpochMs, framesPlayed, lastSeq, evidence):
+      emitEvent("farewell_drained", [
+        "turnId": turnId,
+        "nativeGeneration": nativeGeneration,
+        "drainedAtEpochMs": drainedAtEpochMs,
+        "framesPlayed": framesPlayed,
+        "lastSeq": lastSeq,
+        "evidence": evidence,
+      ])
+    case let .unverified(turnId, nativeGeneration, reason):
+      emitEvent("farewell_unverified", [
+        "turnId": turnId,
+        "nativeGeneration": nativeGeneration,
+        "reason": reason,
+      ])
+    }
   }
 
   private func emitCapturedAudio(_ data: Data) {
@@ -1310,3 +1597,5 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     }
   }
 }
+
+/// Lets a lifetime's stop closure reach the barrier that is created after the lifetime.

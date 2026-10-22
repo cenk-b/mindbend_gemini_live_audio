@@ -42,8 +42,48 @@ abstract class MindbendGeminiLiveAudioPlatform extends PlatformInterface {
     );
   }
 
+  Future<FarewellDrainStatus> beginFarewellDrain({required int expectedFrames}) {
+    throw UnimplementedError('beginFarewellDrain() has not been implemented.');
+  }
+
+  Future<FarewellDrainStatus> cancelFarewellDrain() {
+    throw UnimplementedError('cancelFarewellDrain() has not been implemented.');
+  }
+
+  Future<FarewellDrainStatus> noteFarewellAnchor({
+    required int seq,
+    required int framesPlayed,
+    required int generation,
+    required bool nativeDrained,
+  }) {
+    throw UnimplementedError('noteFarewellAnchor() has not been implemented.');
+  }
+
+  Future<FarewellDrainStatus> farewellDrainStatus() {
+    throw UnimplementedError('farewellDrainStatus() has not been implemented.');
+  }
+
   Future<void> setDebugOptions(GeminiLiveAudioDebugOptions options) {
     throw UnimplementedError('setDebugOptions() has not been implemented.');
+  }
+
+  Future<FarewellPlaybackCapabilities> farewellCapabilities() async =>
+      FarewellPlaybackCapabilities.none;
+
+  Future<bool> beginFarewell({required String turnId, required int nativeGeneration}) {
+    throw UnimplementedError('beginFarewell() has not been implemented.');
+  }
+
+  Future<bool> pushFarewell({required String turnId, required int seq, required Uint8List pcm}) {
+    throw UnimplementedError('pushFarewell() has not been implemented.');
+  }
+
+  Future<bool> endFarewell({required String turnId, required int totalChunks, required int totalFrames}) {
+    throw UnimplementedError('endFarewell() has not been implemented.');
+  }
+
+  Future<void> cancelFarewell({required String turnId, required String reason}) {
+    throw UnimplementedError('cancelFarewell() has not been implemented.');
   }
 
   Stream<Uint8List> get capturedAudio16kStream => throw UnimplementedError(

@@ -24,6 +24,15 @@ void main() {
             case 'pushPlaybackPcm':
               expect(methodCall.arguments, isA<Uint8List>());
               return null;
+            case 'farewellDrainStatus':
+              return <String, Object?>{
+                'generation': 0,
+                'state': 'idle',
+                'evidence': 'none',
+                'framesPlayed': 0,
+                'lastSeq': -1,
+                'restartBlocked': false,
+              };
             default:
               return null;
           }
