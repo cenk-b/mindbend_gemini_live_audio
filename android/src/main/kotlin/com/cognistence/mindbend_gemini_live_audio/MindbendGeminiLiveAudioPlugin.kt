@@ -43,19 +43,19 @@ class MindbendGeminiLiveAudioPlugin :
     private lateinit var eventChannel: EventChannel
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var playbackExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val playbackExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val isSessionRunning = AtomicBoolean(false)
     private val playbackGeneration = AtomicLong(0)
     private val sessionControlGeneration = AtomicLong(0)
     /** Review 1a798d2c HIGH-3 / MEDIUM-5: once detached, no queued start may open audio and no posted delivery
      *  may reach a sink of the removed channels. */
     private val detachFence = PluginDetachFence(sessionControlGeneration)
-    private var sessionExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val sessionExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val farewellDrain = FarewellDrainGate()
     @Volatile private var playbackLifetime: RetiringPlaybackLifetime? = null
     /** One barrier per AudioTrack lifetime. Every write and flush of that track goes through it. */
     @Volatile private var farewellBarrier: FarewellPlaybackBarrier? = null
-    private var farewellPoller = newFarewellPoller()
+    private val farewellPoller = newFarewellPoller()
 
     private fun newFarewellPoller() = FarewellPoller(
         Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "mb-farewell-poll").apply { isDaemon = true } },
@@ -151,11 +151,6 @@ class MindbendGeminiLiveAudioPlugin :
         }
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        // Review round 2: the same instance may be re-attached after a detach shut its executors down.
-        if (sessionExecutor.isShutdown) sessionExecutor = Executors.newSingleThreadExecutor()
-        if (playbackExecutor.isShutdown) playbackExecutor = Executors.newSingleThreadExecutor()
-        if (farewellPoller.isShutdown) farewellPoller = newFarewellPoller()
-        detachFence.attach()
         applicationContext = binding.applicationContext
         methodChannel = MethodChannel(binding.binaryMessenger, "mindbend_gemini_live_audio/methods")
         methodChannel.setMethodCallHandler(this)
@@ -193,6 +188,12 @@ class MindbendGeminiLiveAudioPlugin :
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
             "startSession" -> {
+                // A detached instance is retired for good (as in v0.0.13, whose detach shut its executors down;
+                // Flutter attaches a new instance per engine). Refuse cleanly instead of throwing.
+                if (detachFence.detached) {
+                    result.success(staleResult("plugin_detached"))
+                    return
+                }
                 val requestGeneration = sessionControlGeneration.get()
                 val attachment = detachFence.attachment
                 sessionExecutor.execute {
@@ -203,6 +204,10 @@ class MindbendGeminiLiveAudioPlugin :
                 }
             }
             "stopSession" -> {
+                if (detachFence.detached) {
+                    result.success(null)
+                    return
+                }
                 sessionControlGeneration.incrementAndGet()
                 playbackLifetime?.cancel()
                 val attachment = detachFence.attachment
@@ -1070,7 +1075,7 @@ internal class PluginDetachFence(private val generation: AtomicLong) {
     @Volatile var detached = false
         private set
 
-    /** Bumped by every detach and attach; work captures it and is dropped once it changes (review round 3). */
+    /** Bumped by detach; queued work and posted deliveries capture it and are dropped once it changes. */
     @Volatile var attachment = 0L
         private set
 
@@ -1078,12 +1083,6 @@ internal class PluginDetachFence(private val generation: AtomicLong) {
         detached = true
         attachment++
         generation.incrementAndGet()
-    }
-
-    /** A new attach admits only starts requested after it. */
-    @Synchronized fun attach() {
-        detached = false
-        attachment++
     }
 
     fun isCurrent(captured: Long): Boolean = !detached && captured == attachment
