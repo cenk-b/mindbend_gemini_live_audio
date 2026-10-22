@@ -194,16 +194,20 @@ class MindbendGeminiLiveAudioPlugin :
         when (call.method) {
             "startSession" -> {
                 val requestGeneration = sessionControlGeneration.get()
+                val attachment = detachFence.attachment
                 sessionExecutor.execute {
-                    val payload = startSession(requestGeneration)
+                    // Review round 3: work queued under an earlier attachment never touches the current one.
+                    val payload = if (detachFence.isCurrent(attachment)) startSession(requestGeneration)
+                        else staleResult("session_start_cancelled")
                     mainHandler.post { result.success(payload) }
                 }
             }
             "stopSession" -> {
                 sessionControlGeneration.incrementAndGet()
                 playbackLifetime?.cancel()
+                val attachment = detachFence.attachment
                 sessionExecutor.execute {
-                    stopSessionInternal(restoreAudioState = true)
+                    if (detachFence.isCurrent(attachment)) stopSessionInternal(restoreAudioState = true)
                     mainHandler.post { result.success(null) }
                 }
             }
@@ -337,7 +341,7 @@ class MindbendGeminiLiveAudioPlugin :
 
     @Synchronized
     private fun startSession(requestGeneration: Long): Map<String, Any?> {
-        if (!detachFence.admits(requestGeneration)) return fallbackResult("session_start_cancelled")
+        if (!detachFence.admits(requestGeneration)) return staleResult("session_start_cancelled")
         if (isSessionRunning.get() && playbackLifetime?.isRetired() == true) {
             stopSessionInternal(restoreAudioState = false)
         }
@@ -749,6 +753,15 @@ class MindbendGeminiLiveAudioPlugin :
         }
     }
 
+    /** A refused start from an earlier attachment: reports, never stops anything. */
+    private fun staleResult(errorCode: String): Map<String, Any?> = startResult(
+        aecActive = false,
+        nsActive = false,
+        agcActive = false,
+        transportMode = "legacy_half_duplex",
+        errorCode = errorCode,
+    )
+
     private fun fallbackResult(errorCode: String): Map<String, Any?> {
         stopSessionInternal(restoreAudioState = true)
         return startResult(
@@ -803,8 +816,9 @@ class MindbendGeminiLiveAudioPlugin :
 
     private fun emitCapturedAudio(bytes: ByteArray) {
         val sink = capturedAudioSink ?: return
+        val attachment = detachFence.attachment
         mainHandler.post {
-            if (detachFence.detached) return@post
+            if (!detachFence.isCurrent(attachment)) return@post
             if (!captureFirstChunkDelivered) {
                 captureFirstChunkDelivered = true
                 emitEvent(
@@ -818,8 +832,9 @@ class MindbendGeminiLiveAudioPlugin :
 
     private fun emitEvent(type: String, details: Map<String, Any?> = emptyMap()) {
         val sink = eventSink ?: return
+        val attachment = detachFence.attachment
         mainHandler.post {
-            if (detachFence.detached) return@post
+            if (!detachFence.isCurrent(attachment)) return@post
             val payload = hashMapOf<String, Any?>(
                 "type" to type,
                 "platform" to "android",
@@ -1055,15 +1070,23 @@ internal class PluginDetachFence(private val generation: AtomicLong) {
     @Volatile var detached = false
         private set
 
-    fun detach() {
+    /** Bumped by every detach and attach; work captures it and is dropped once it changes (review round 3). */
+    @Volatile var attachment = 0L
+        private set
+
+    @Synchronized fun detach() {
         detached = true
+        attachment++
         generation.incrementAndGet()
     }
 
     /** A new attach admits only starts requested after it. */
-    fun attach() {
+    @Synchronized fun attach() {
         detached = false
+        attachment++
     }
+
+    fun isCurrent(captured: Long): Boolean = !detached && captured == attachment
 
     fun admits(requestGeneration: Long): Boolean = !detached && requestGeneration == generation.get()
 }

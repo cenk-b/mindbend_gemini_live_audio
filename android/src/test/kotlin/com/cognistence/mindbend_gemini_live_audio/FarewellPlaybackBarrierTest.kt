@@ -88,4 +88,19 @@ class FarewellPlaybackBarrierTest {
         assertEquals(false, fence.admits(queuedStart), "a start queued before the detach stays refused")
         assertEquals(true, fence.admits(generation.get()), "a start requested after re-attach is admitted")
     }
+
+    /** Review round 3: work captured under one attachment (a posted event, a queued start or stop) is dropped
+     *  after detach AND after a re-attach of the same instance; only work captured afterwards is current. */
+    @Test
+    fun workCapturedBeforeADetachIsNeverCurrentAgain() {
+        val fence = PluginDetachFence(AtomicLong(0))
+        fence.attach()
+        val before = fence.attachment
+        assertEquals(true, fence.isCurrent(before))
+        fence.detach()
+        assertEquals(false, fence.isCurrent(before))
+        fence.attach()
+        assertEquals(false, fence.isCurrent(before), "re-attach must not revive old deliveries")
+        assertEquals(true, fence.isCurrent(fence.attachment))
+    }
 }
