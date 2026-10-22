@@ -43,19 +43,21 @@ class MindbendGeminiLiveAudioPlugin :
     private lateinit var eventChannel: EventChannel
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val playbackExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private var playbackExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val isSessionRunning = AtomicBoolean(false)
     private val playbackGeneration = AtomicLong(0)
     private val sessionControlGeneration = AtomicLong(0)
     /** Review 1a798d2c HIGH-3 / MEDIUM-5: once detached, no queued start may open audio and no posted delivery
      *  may reach a sink of the removed channels. */
     private val detachFence = PluginDetachFence(sessionControlGeneration)
-    private val sessionExecutor = Executors.newSingleThreadExecutor()
+    private var sessionExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val farewellDrain = FarewellDrainGate()
     @Volatile private var playbackLifetime: RetiringPlaybackLifetime? = null
     /** One barrier per AudioTrack lifetime. Every write and flush of that track goes through it. */
     @Volatile private var farewellBarrier: FarewellPlaybackBarrier? = null
-    private val farewellPoller = FarewellPoller(
+    private var farewellPoller = newFarewellPoller()
+
+    private fun newFarewellPoller() = FarewellPoller(
         Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "mb-farewell-poll").apply { isDaemon = true } },
     )
 
@@ -149,6 +151,11 @@ class MindbendGeminiLiveAudioPlugin :
         }
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        // Review round 2: the same instance may be re-attached after a detach shut its executors down.
+        if (sessionExecutor.isShutdown) sessionExecutor = Executors.newSingleThreadExecutor()
+        if (playbackExecutor.isShutdown) playbackExecutor = Executors.newSingleThreadExecutor()
+        if (farewellPoller.isShutdown) farewellPoller = newFarewellPoller()
+        detachFence.attach()
         applicationContext = binding.applicationContext
         methodChannel = MethodChannel(binding.binaryMessenger, "mindbend_gemini_live_audio/methods")
         methodChannel.setMethodCallHandler(this)
@@ -878,6 +885,8 @@ internal class FarewellPoller(private val executor: ScheduledExecutorService) {
 
     fun shutdown() { stop(); executor.shutdownNow() }
 
+    val isShutdown: Boolean get() = executor.isShutdown
+
     private companion object {
         const val POLL_MS = 10L
     }
@@ -888,7 +897,8 @@ internal class FarewellPoller(private val executor: ScheduledExecutorService) {
  * so a retired track is never touched again: a retired or throwing write reads as a write error and
  * a retired track reads as idle (no timestamp, not playing), which fails an open farewell closed.
  */
-internal class LifetimeAudioTrackPort(
+/** Public: the example app's instrumentation test (a separate module) drives it on a real AudioTrack. */
+class LifetimeAudioTrackPort(
     private val track: AudioTrack,
     private val lifetime: RetiringPlaybackLifetime,
 ) : FarewellTrackPort {
@@ -1048,6 +1058,11 @@ internal class PluginDetachFence(private val generation: AtomicLong) {
     fun detach() {
         detached = true
         generation.incrementAndGet()
+    }
+
+    /** A new attach admits only starts requested after it. */
+    fun attach() {
+        detached = false
     }
 
     fun admits(requestGeneration: Long): Boolean = !detached && requestGeneration == generation.get()

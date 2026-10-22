@@ -82,6 +82,15 @@ class LabFarewellPlaybackBarrierTest {
         assertTrue(events.single() is FarewellBarrierEvent.Drained)
     }
 
+    /** Review round 2: later cancels for turns that never begin must not evict an earlier, still-relevant one. */
+    @Test fun r22b_manyLaterCancelsNeverEvictAnEarlierOne() {
+        barrier.cancel("fw_T", "cancelled")
+        for (i in 0 until 40) barrier.cancel("fw_other_$i", "cancelled")
+        barrier.begin("fw_T", 11)
+        assertTrue(!barrier.push("fw_T", 0, pcm(2400)))
+        assertEquals(listOf(FarewellBarrierEvent.Unverified("fw_T", 11, "cancelled")), events)
+    }
+
     @Test fun k1_drainsOnlyWhenPresentedTimestampReachesLastFrame() {
         turn(2400, 2400)
         track.consume(4800); barrier.poll()        // all written frames consumed (head = 4800) ...

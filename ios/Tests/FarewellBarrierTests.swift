@@ -161,23 +161,46 @@ final class FarewellBarrierUnitTests: XCTestCase {
     XCTAssertEqual(id, "fw_U")
   }
 
+  /// Lets queued anchor retries run (the barrier waits up to ~100 ms for an anchor at or after a callback).
+  func settle() { for _ in 0..<40 { RunLoop.current.run(until: Date().addingTimeInterval(0.005)); flush() } }
+
+  func testI25_manyLaterCancelsNeverEvictAnEarlierOne() {
+    barrier.cancel(turnId: "fw_T", reason: "cancelled")
+    for i in 0..<40 { barrier.cancel(turnId: "fw_other_\(i)", reason: "cancelled") }
+    barrier.begin(turnId: "fw_T", nativeGeneration: 11)
+    XCTAssertFalse(barrier.push(turnId: "fw_T", seq: 0, pcm16: pcm(480)))
+    XCTAssertEqual(events, [.unverified(turnId: "fw_T", nativeGeneration: 11, reason: "cancelled")])
+  }
+
   func testI21_staleRenderAnchorIsNeverExtrapolatedIntoADrain() {
     // Review 1a798d2c HIGH-2: rendering stopped at frame 3000; a discard callback arrives 200 ms of host time
-    // later. Extrapolating from the frozen anchor would claim frame 7800 >= 7200 + 528. It must not drain.
+    // later. Projecting forward from the frozen anchor would claim frame 7800 >= 7200 + 528. It must not drain.
     playTurn([4800])                       // 2400 ..< 7200
     player.frozenAnchor = (3000, player.host(3000))
     player.scheduled[0].fired = true
-    player.scheduled[0].cb(player.host(3000) + 4800); flush()
-    guard case .unverified(_, _, let reason) = events.first else { return XCTFail("expected unverified, got \(events)") }
-    XCTAssertTrue(reason.hasPrefix("render_anchor_stale"), reason)
+    player.scheduled[0].cb(player.host(3000) + 4800); settle()
+    XCTAssertEqual(events, [.unverified(turnId: "fw_T", nativeGeneration: 11, reason: "render_anchor_stale")])
   }
 
-  func testI22_freshAnchorJustBeforeTheCallbackStillDrains() {
+  func testI24_aShortStallJustBeforeTheEndIsNotProjectedPast() {
+    // Review round 2: frozen at 6960 (240 frames short of 7200), a callback 32 ms later must not project to
+    // 7728 and drain.
     playTurn([4800])
-    player.advance(to: 7200 + 528 - 240)   // anchor 10 ms before the instant end + latency is reached
+    player.frozenAnchor = (6960, player.host(6960))
+    player.scheduled[0].fired = true
+    player.scheduled[0].cb(player.host(6960) + 768); settle()
+    XCTAssertEqual(events, [.unverified(turnId: "fw_T", nativeGeneration: 11, reason: "render_anchor_stale")])
+  }
+
+  func testI22_anOlderAnchorWaitsForRenderingToCatchUpAndThenDrains() {
+    playTurn([4800])
     player.frozenAnchor = (7200 + 528 - 240, player.host(7200 + 528 - 240))
     player.scheduled[0].fired = true
     player.scheduled[0].cb(player.host(7200 + 528)); flush()
+    XCTAssertTrue(events.isEmpty, "judged only once an anchor at or after the callback exists")
+    player.frozenAnchor = nil
+    player.pos = 7200 + 528 + 240           // rendering continued past the callback instant
+    settle()
     guard case .drained = events.first else { return XCTFail("expected drained, got \(events)") }
   }
 
@@ -223,9 +246,10 @@ final class FarewellBarrierUnitTests: XCTestCase {
     barrier.end(turnId: "fw_T", totalChunks: 2, totalFrames: 960)
     // Flush callback for seq 1 observed with the pre-stop anchor (the race seen in the I13 fuzz).
     let cb = player.scheduled[1].cb; player.scheduled[1].fired = true
-    cb(player.host(20_100)); flush()
+    cb(player.host(20_100)); settle()
     guard case .unverified(_, _, let reason) = events.first else { return XCTFail("expected unverified, got \(events)") }
-    XCTAssertTrue(reason.hasPrefix("played_back_before_end_frame"), reason)
+    // The anchor predates the callback, so it is never projected forward: fails closed either way.
+    XCTAssertTrue(reason.hasPrefix("played_back_before_end_frame") || reason == "render_anchor_stale", reason)
   }
 
   func testI15_nilPlayheadAtScheduleFailsClosed_pausedTimeline() {

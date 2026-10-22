@@ -39,7 +39,6 @@ sealed class FarewellBarrierEvent {
 }
 
 private const val FLUSHED_DURING_WRITE = -100_000
-private const val MAX_EARLY_CANCELS = 16
 
 class FarewellPlaybackBarrier(
     private val track: FarewellTrackPort,
@@ -117,7 +116,7 @@ class FarewellPlaybackBarrier(
      *  write in flight clears it, every farewell fails closed with track_unsynced (adapter obligation). */
     @Synchronized fun needsResync(): Boolean = unsynced
 
-    /** Turns cancelled before their BEGIN reached the data lane (review 1a798d2c HIGH-1), bounded. */
+    /** Turns cancelled before their BEGIN reached the data lane (review 1a798d2c HIGH-1). */
     private val cancelledBeforeBegin = LinkedHashMap<String, String>()
 
     @Synchronized fun begin(turnId: String, nativeGeneration: Int) {
@@ -286,10 +285,9 @@ class FarewellPlaybackBarrier(
         val t = turn
         if (t != null && t.id == turnId) { invalidate(reason); return }
         // BEGIN may still be queued behind a parked write on the data lane: remember the cancel for it.
+        // Not evicted (review round 2): an evicted entry would re-open the cancel. The barrier lives for one
+        // playback lifetime and the app cancels only turns it began, so this stays small.
         cancelledBeforeBegin[turnId] = reason
-        while (cancelledBeforeBegin.size > MAX_EARLY_CANCELS) {
-            cancelledBeforeBegin.remove(cancelledBeforeBegin.keys.first())
-        }
     }
 
     /** Pause/flush/stop/route/recovery from the plugin: the active farewell can never drain. */

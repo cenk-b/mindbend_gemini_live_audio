@@ -43,8 +43,10 @@ protocol FarewellPlayer: AnyObject {
 }
 
 final class FarewellPlaybackBarrier {
-  /// Longest forward projection from a render anchor to a played-back callback (several IO cycles).
-  static let maxForwardProjectionSec: Double = 0.1
+  /// A played-back callback is judged only from a render anchor taken AT OR AFTER it. While the anchor is
+  /// older, the judgement is retried this often, at most this many times (~100 ms), then fails closed.
+  static let anchorRetryIntervalMs = 5
+  static let anchorRetryLimit = 20
   typealias Emit = (FarewellBarrierEvent) -> Void
 
   private struct Turn {
@@ -211,18 +213,25 @@ final class FarewellPlaybackBarrier {
     maybeDrained()
   }
 
-  private func _playedBack(epoch captured: Int, turnId: String, seq: Int, host hostAtCallback: UInt64) {
+  private func _playedBack(epoch captured: Int, turnId: String, seq: Int, host hostAtCallback: UInt64,
+                           attempt: Int = 0) {
     guard captured == epoch, var t = turn, t.id == turnId, !t.terminal else { staleCallbacks += 1; return }
     guard let endFrame = t.endFrames[seq] else { staleCallbacks += 1; return }
     // `.dataPlayedBack` also fires when stop() flushes the buffer: judge the position AT the callback instant
     // (IOS-1), reconstructed from a render anchor read here, off the handler (IOS-2). No anchor = not rendering.
     guard let a = player.renderAnchor() else { fail(&t, "played_back_without_position"); return }
     let dtSec = (Double(hostAtCallback) - Double(a.hostTime)) / player.hostTicksPerSecond
-    // Review 1a798d2c HIGH-2: projecting FORWARD from an old anchor assumes rendering continued. A stalled
-    // render clock would then "advance" with wall time and verify audio that never played. Only an anchor
-    // within a few IO cycles of the callback may vouch for its position; anything older fails closed.
-    guard dtSec <= FarewellPlaybackBarrier.maxForwardProjectionSec else {
-      fail(&t, "render_anchor_stale(dt=\(Int(dtSec * 1000))ms)"); return
+    // Review 1a798d2c HIGH-2: projecting FORWARD from an older anchor assumes rendering continued, so a stalled
+    // render clock would "advance" with wall time and verify audio that never played. Only project BACKWARD
+    // from an anchor taken at or after the callback (that can only under-count). Wait briefly for one.
+    if dtSec > 0 {
+      guard attempt < FarewellPlaybackBarrier.anchorRetryLimit else {
+        fail(&t, "render_anchor_stale"); return
+      }
+      queue.asyncAfter(deadline: .now() + .milliseconds(FarewellPlaybackBarrier.anchorRetryIntervalMs)) { [weak self] in
+        self?._playedBack(epoch: captured, turnId: turnId, seq: seq, host: hostAtCallback, attempt: attempt + 1)
+      }
+      return
     }
     let pos = a.sampleTime + Int64((dtSec * player.sampleRate).rounded(.down))
     let required = endFrame + player.presentationLatencyFrames()
@@ -246,14 +255,15 @@ final class FarewellPlaybackBarrier {
   }
 
   /// Turns cancelled before their BEGIN reached this queue (review 1a798d2c HIGH-1: farewellBegin hops through
-  /// the plugin's session queue, farewellCancel does not), oldest first, bounded.
+  /// the plugin's session queue, farewellCancel does not).
   private var cancelledBeforeBegin: [(id: String, reason: String)] = []
 
   private func _cancel(_ id: String, _ reason: String) {
     guard turn?.id == id else {
+      // Not evicted (review round 2): an evicted entry would re-open the cancel. The barrier lives for one
+      // playback lifetime and the app cancels only turns it began, so this stays small.
       cancelledBeforeBegin.removeAll { $0.id == id }
       cancelledBeforeBegin.append((id, reason))
-      if cancelledBeforeBegin.count > 16 { cancelledBeforeBegin.removeFirst() }
       return
     }
     _invalidate(reason, stopPlayer: true)

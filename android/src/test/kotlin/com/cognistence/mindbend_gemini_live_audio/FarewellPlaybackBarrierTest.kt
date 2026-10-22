@@ -84,5 +84,8 @@ class FarewellPlaybackBarrierTest {
         assertEquals(true, fence.detached)
         assertEquals(false, fence.admits(queuedStart))
         assertEquals(false, fence.admits(generation.get()), "nothing is admitted after detach")
+        fence.attach()
+        assertEquals(false, fence.admits(queuedStart), "a start queued before the detach stays refused")
+        assertEquals(true, fence.admits(generation.get()), "a start requested after re-attach is admitted")
     }
 }
