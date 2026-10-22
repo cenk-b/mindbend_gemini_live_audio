@@ -145,6 +145,17 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   /// work accepted before detach must never touch the shared AVAudioSession afterwards.
   private var retiredFromEngine: Bool { eventDelivery.isDetached }
 
+  /// Every shared-session mutation goes through here, so retirement is rechecked before each one:
+  /// a call stalled across a detach cannot be followed by another mutation. (The one native call
+  /// already in flight when detach lands can still complete; detach never waits on sessionQueue.)
+  private func mutateSharedSession(_ body: () throws -> Void) throws {
+    if retiredFromEngine {
+      throw NSError(domain: "mindbend_gemini_live_audio", code: -33,
+        userInfo: [NSLocalizedDescriptionKey: "Plugin was detached from its engine."])
+    }
+    try body()
+  }
+
   private var engine: AVAudioEngine?
   private var playerNode: AVAudioPlayerNode?
   private var captureConverter: AVAudioConverter?
@@ -465,13 +476,15 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         throw NSError(domain: "mindbend_gemini_live_audio", code: -32,
           userInfo: [NSLocalizedDescriptionKey: "Session start cancelled before audio session setup."])
       }
-      try audioSession.setCategory(
-        .playAndRecord,
-        mode: .voiceChat,
-        options: [.allowBluetooth, .defaultToSpeaker]
-      )
-      try audioSession.setPreferredIOBufferDuration(0.01)
-      try audioSession.setActive(true, options: [])
+      try mutateSharedSession {
+        try audioSession.setCategory(
+          .playAndRecord,
+          mode: .voiceChat,
+          options: [.allowBluetooth, .defaultToSpeaker]
+        )
+      }
+      try mutateSharedSession { try audioSession.setPreferredIOBufferDuration(0.01) }
+      try mutateSharedSession { try audioSession.setActive(true, options: []) }
       registerAudioSessionObserversLocked()
 
       let audioEngine = AVAudioEngine()
@@ -1133,13 +1146,10 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     let maxAttempts = 3
     var lastThrownError: Error?
 
-    if retiredFromEngine {
-      throw NSError(domain: "mindbend_gemini_live_audio", code: -33,
-        userInfo: [NSLocalizedDescriptionKey: "Plugin was detached from its engine."])
-    }
     for attempt in 1...maxAttempts {
       do {
-        try audioSession.setActive(true, options: [])
+        // Rechecked on every attempt: a detach during the retry sleep stops further activation.
+        try mutateSharedSession { try audioSession.setActive(true, options: []) }
         audioEngine.prepare()
         if !audioEngine.isRunning {
           try audioEngine.start()
@@ -1148,6 +1158,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
           _ = lifetime.boundary { player.play() }
         }
       } catch {
+        if retiredFromEngine { throw error }
         lastThrownError = error
       }
 
@@ -1193,12 +1204,14 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   private func recoverAudioSessionLocked(trigger: String) {
     guard isSessionRunning, !retiredFromEngine else { return }
     do {
-      try audioSession.setCategory(
-        .playAndRecord,
-        mode: .voiceChat,
-        options: [.allowBluetooth, .defaultToSpeaker]
-      )
-      try audioSession.setPreferredIOBufferDuration(0.01)
+      try mutateSharedSession {
+        try audioSession.setCategory(
+          .playAndRecord,
+          mode: .voiceChat,
+          options: [.allowBluetooth, .defaultToSpeaker]
+        )
+      }
+      try mutateSharedSession { try audioSession.setPreferredIOBufferDuration(0.01) }
       if let audioEngine = engine, let player = playerNode {
         try ensureEngineRunningLocked(
           audioEngine,
@@ -1565,11 +1578,13 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     if restoreAudioSession && !retiredFromEngine {
       do {
         if let previousCategory, let previousMode {
-          try audioSession.setCategory(previousCategory, mode: previousMode, options: previousOptions)
+          try mutateSharedSession {
+            try audioSession.setCategory(previousCategory, mode: previousMode, options: previousOptions)
+          }
         }
-        try audioSession.setActive(false, options: [.notifyOthersOnDeactivation])
+        try mutateSharedSession { try audioSession.setActive(false, options: [.notifyOthersOnDeactivation]) }
       } catch {
-        emitEvent("error", ["code": "ios_restore_session_failed"])
+        if !retiredFromEngine { emitEvent("error", ["code": "ios_restore_session_failed"]) }
       }
     }
 
