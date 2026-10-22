@@ -665,3 +665,59 @@ final class FarewellBarrierPluginPortTests: XCTestCase {
     if let d = drainedAfter { XCTAssertLessThan(d, 2.0) }
   }
 }
+
+/// UID 505 review of b113d222, findings 2 and 3: a payload queued for one Dart subscription must never be
+/// delivered to a replacement subscription, and nothing may be delivered after the engine detaches.
+final class DeliveryEpochGateTests: XCTestCase {
+  func testG1_nothingIsStampedWithoutAListener() {
+    let gate = DeliveryEpochGate()
+    XCTAssertNil(gate.stamp())
+    gate.listen()
+    XCTAssertNotNil(gate.stamp())
+    gate.cancel()
+    XCTAssertNil(gate.stamp())
+  }
+
+  func testG2_payloadQueuedBeforeCancelAndRelistenIsDropped() {
+    let gate = DeliveryEpochGate()
+    gate.listen()
+    let oldPcm = gate.stamp()!   // old capture callback queues PCM
+    gate.cancel()                // queued cancel runs first
+    gate.listen()                // then the replacement listen
+    XCTAssertFalse(gate.admits(oldPcm), "old subscription's bytes must not reach the new sink")
+    let newPcm = gate.stamp()!
+    XCTAssertTrue(gate.admits(newPcm))
+  }
+
+  func testG3_relistenWithoutCancelStillFencesTheOldSubscription() {
+    let gate = DeliveryEpochGate()
+    gate.listen()
+    let queued = gate.stamp()!
+    gate.listen()
+    XCTAssertFalse(gate.admits(queued))
+  }
+
+  func testG4_detachRefusesListenersAndDropsEverythingQueued() {
+    let gate = DeliveryEpochGate()
+    gate.listen()
+    let queued = gate.stamp()!
+    gate.detach()
+    XCTAssertTrue(gate.isDetached)
+    XCTAssertFalse(gate.admits(queued))
+    XCTAssertFalse(gate.listen(), "a detached instance must not accept a new listener")
+    XCTAssertNil(gate.stamp())
+  }
+
+  func testG5_concurrentStampsAcrossARelistenNeverAdmitTheOldEpoch() {
+    let gate = DeliveryEpochGate()
+    gate.listen()
+    let lock = NSLock()
+    var before: [Int] = []
+    DispatchQueue.concurrentPerform(iterations: 200) { _ in
+      if let s = gate.stamp() { lock.lock(); before.append(s); lock.unlock() }
+    }
+    gate.cancel()
+    gate.listen()
+    XCTAssertFalse(before.contains { gate.admits($0) })
+  }
+}

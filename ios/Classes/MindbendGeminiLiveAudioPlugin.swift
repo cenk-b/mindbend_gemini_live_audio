@@ -138,6 +138,23 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   private var eventStreamHandler: ClosureStreamHandler?
   private var captureEventSink: FlutterEventSink?
   private var eventSink: FlutterEventSink?
+  // Payloads are stamped when queued and delivered only to the subscription they were queued for.
+  private let captureDelivery = DeliveryEpochGate()
+  private let eventDelivery = DeliveryEpochGate()
+  /// Detached from its engine. Checked where queued work executes, not only where calls enter:
+  /// work accepted before detach must never touch the shared AVAudioSession afterwards.
+  private var retiredFromEngine: Bool { eventDelivery.isDetached }
+
+  /// Every shared-session mutation goes through here, so retirement is rechecked before each one:
+  /// a call stalled across a detach cannot be followed by another mutation. (The one native call
+  /// already in flight when detach lands can still complete; detach never waits on sessionQueue.)
+  private func mutateSharedSession(_ body: () throws -> Void) throws {
+    if retiredFromEngine {
+      throw NSError(domain: "mindbend_gemini_live_audio", code: -33,
+        userInfo: [NSLocalizedDescriptionKey: "Plugin was detached from its engine."])
+    }
+    try body()
+  }
 
   private var engine: AVAudioEngine?
   private var playerNode: AVAudioPlayerNode?
@@ -178,6 +195,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
 
   public static func register(with registrar: FlutterPluginRegistrar) {
     let instance = MindbendGeminiLiveAudioPlugin()
+    // Publishing is what makes the engine call detachFromEngine(for:) on this instance.
+    registrar.publish(instance)
 
     let methodChannel = FlutterMethodChannel(
       name: "mindbend_gemini_live_audio/methods",
@@ -196,20 +215,24 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
 
     let captureHandler = ClosureStreamHandler(
       onListen: { [weak instance] sink in
-        instance?.captureEventSink = sink
-        instance?.captureSinkMissingLogged = false
-        instance?.emitEvent("capture_sink_attached")
+        guard let instance, instance.captureDelivery.listen() else { return }
+        instance.captureEventSink = sink
+        instance.captureSinkMissingLogged = false
+        instance.emitEvent("capture_sink_attached")
       },
       onCancel: { [weak instance] in
+        instance?.captureDelivery.cancel()
         instance?.captureEventSink = nil
       }
     )
     let eventHandler = ClosureStreamHandler(
       onListen: { [weak instance] sink in
-        instance?.eventSink = sink
-        instance?.emitEvent("event_sink_attached")
+        guard let instance, instance.eventDelivery.listen() else { return }
+        instance.eventSink = sink
+        instance.emitEvent("event_sink_attached")
       },
       onCancel: { [weak instance] in
+        instance?.eventDelivery.cancel()
         instance?.eventSink = nil
       }
     )
@@ -220,7 +243,28 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     eventChannel.setStreamHandler(eventHandler)
   }
 
+  /// The engine is going away. Retire this instance: refuse new calls and listeners, drop every
+  /// queued delivery, invalidate any start in progress and stop its own engine. The shared
+  /// AVAudioSession is left alone, since a replacement instance may already own it.
+  public func detachFromEngine(for registrar: FlutterPluginRegistrar) {
+    captureDelivery.detach()
+    eventDelivery.detach()
+    captureEventSink = nil
+    eventSink = nil
+    invalidatePendingStart()
+    farewellBarrier?.invalidateAsync(reason: "engine_detached")
+    playbackLifetime?.cancel()
+    // Strong capture on purpose: teardown must run even though the engine dropped this instance.
+    sessionQueue.async {
+      self.stopSessionLocked(restoreAudioSession: false)
+    }
+  }
+
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    if eventDelivery.isDetached {
+      result(FlutterError(code: "plugin_detached", message: "Plugin was detached from its engine.", details: nil))
+      return
+    }
     switch call.method {
     case "startSession":
       let requestGeneration = captureControlGeneration()
@@ -428,13 +472,19 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       previousMode = audioSession.mode
       previousOptions = audioSession.categoryOptions
 
-      try audioSession.setCategory(
-        .playAndRecord,
-        mode: .voiceChat,
-        options: [.allowBluetooth, .defaultToSpeaker]
-      )
-      try audioSession.setPreferredIOBufferDuration(0.01)
-      try audioSession.setActive(true, options: [])
+      if requestGeneration != captureControlGeneration() || retiredFromEngine {
+        throw NSError(domain: "mindbend_gemini_live_audio", code: -32,
+          userInfo: [NSLocalizedDescriptionKey: "Session start cancelled before audio session setup."])
+      }
+      try mutateSharedSession {
+        try audioSession.setCategory(
+          .playAndRecord,
+          mode: .voiceChat,
+          options: [.allowBluetooth, .defaultToSpeaker]
+        )
+      }
+      try mutateSharedSession { try audioSession.setPreferredIOBufferDuration(0.01) }
+      try mutateSharedSession { try audioSession.setActive(true, options: []) }
       registerAudioSessionObserversLocked()
 
       let audioEngine = AVAudioEngine()
@@ -532,6 +582,10 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         trigger: "session_start",
         failureCode: "ios_engine_not_running_after_start"
       )
+      if requestGeneration != captureControlGeneration() {
+        throw NSError(domain: "mindbend_gemini_live_audio", code: -31,
+          userInfo: [NSLocalizedDescriptionKey: "Session start cancelled after engine start."])
+      }
 
       isSessionRunning = true
       playbackDidStart = false
@@ -588,7 +642,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       )
     } catch {
       let failureCode = nativeErrorCode(from: error) ?? "ios_start_failed"
-      stopSessionLocked(restoreAudioSession: true)
+      stopSessionLocked(restoreAudioSession: !eventDelivery.isDetached)
       emitEvent("error", ["code": failureCode])
       return startResult(
         aecActive: false,
@@ -1094,7 +1148,8 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
 
     for attempt in 1...maxAttempts {
       do {
-        try audioSession.setActive(true, options: [])
+        // Rechecked on every attempt: a detach during the retry sleep stops further activation.
+        try mutateSharedSession { try audioSession.setActive(true, options: []) }
         audioEngine.prepare()
         if !audioEngine.isRunning {
           try audioEngine.start()
@@ -1103,6 +1158,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
           _ = lifetime.boundary { player.play() }
         }
       } catch {
+        if retiredFromEngine { throw error }
         lastThrownError = error
       }
 
@@ -1146,14 +1202,16 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   }
 
   private func recoverAudioSessionLocked(trigger: String) {
-    guard isSessionRunning else { return }
+    guard isSessionRunning, !retiredFromEngine else { return }
     do {
-      try audioSession.setCategory(
-        .playAndRecord,
-        mode: .voiceChat,
-        options: [.allowBluetooth, .defaultToSpeaker]
-      )
-      try audioSession.setPreferredIOBufferDuration(0.01)
+      try mutateSharedSession {
+        try audioSession.setCategory(
+          .playAndRecord,
+          mode: .voiceChat,
+          options: [.allowBluetooth, .defaultToSpeaker]
+        )
+      }
+      try mutateSharedSession { try audioSession.setPreferredIOBufferDuration(0.01) }
       if let audioEngine = engine, let player = playerNode {
         try ensureEngineRunningLocked(
           audioEngine,
@@ -1517,14 +1575,16 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     cancelPlaybackProbesLocked()
     sessionStartedAtMs = nil
 
-    if restoreAudioSession {
+    if restoreAudioSession && !retiredFromEngine {
       do {
         if let previousCategory, let previousMode {
-          try audioSession.setCategory(previousCategory, mode: previousMode, options: previousOptions)
+          try mutateSharedSession {
+            try audioSession.setCategory(previousCategory, mode: previousMode, options: previousOptions)
+          }
         }
-        try audioSession.setActive(false, options: [.notifyOthersOnDeactivation])
+        try mutateSharedSession { try audioSession.setActive(false, options: [.notifyOthersOnDeactivation]) }
       } catch {
-        emitEvent("error", ["code": "ios_restore_session_failed"])
+        if !retiredFromEngine { emitEvent("error", ["code": "ios_restore_session_failed"]) }
       }
     }
 
@@ -1555,9 +1615,12 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     // Avoid capturing a stale sink closure across async hops. During
     // hot-restart/dispose, EventChannel callbacks can be deleted while queued
     // blocks are still pending, which can abort the Dart VM.
+    let stamp = captureDelivery.stamp()
     DispatchQueue.main.async { [weak self] in
       guard let self else { return }
-      guard let sink = self.captureEventSink else {
+      if let stamp, !self.captureDelivery.admits(stamp) { return }
+      guard stamp != nil, let sink = self.captureEventSink else {
+        if self.captureDelivery.isDetached || self.captureEventSink != nil { return }
         if !self.captureSinkMissingLogged {
           self.captureSinkMissingLogged = true
           self.emitEvent("capture_sink_missing")
@@ -1591,8 +1654,9 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
         payload[key] = value
       }
     }
+    guard let stamp = eventDelivery.stamp() else { return }
     DispatchQueue.main.async { [weak self] in
-      guard let self, let sink = self.eventSink else { return }
+      guard let self, self.eventDelivery.admits(stamp), let sink = self.eventSink else { return }
       sink(payload)
     }
   }

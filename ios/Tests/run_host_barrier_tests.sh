@@ -7,7 +7,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 CLASSES="$HERE/../Classes"
 WORK="${1:-$(mktemp -d)}"
 mkdir -p "$WORK/Sources/FarewellBarrier" "$WORK/Tests/FarewellBarrierTests"
-for f in FarewellPlaybackBarrier.swift PluginFarewellPlayer.swift RetiringPlaybackLifetime.swift; do
+for f in FarewellPlaybackBarrier.swift PluginFarewellPlayer.swift RetiringPlaybackLifetime.swift DeliveryEpochGate.swift; do
   cp "$CLASSES/$f" "$WORK/Sources/FarewellBarrier/$f"
   shasum -a 256 "$CLASSES/$f"
 done
