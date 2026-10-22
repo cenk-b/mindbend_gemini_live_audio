@@ -141,6 +141,9 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   // Payloads are stamped when queued and delivered only to the subscription they were queued for.
   private let captureDelivery = DeliveryEpochGate()
   private let eventDelivery = DeliveryEpochGate()
+  /// Detached from its engine. Checked where queued work executes, not only where calls enter:
+  /// work accepted before detach must never touch the shared AVAudioSession afterwards.
+  private var retiredFromEngine: Bool { eventDelivery.isDetached }
 
   private var engine: AVAudioEngine?
   private var playerNode: AVAudioPlayerNode?
@@ -458,6 +461,10 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       previousMode = audioSession.mode
       previousOptions = audioSession.categoryOptions
 
+      if requestGeneration != captureControlGeneration() || retiredFromEngine {
+        throw NSError(domain: "mindbend_gemini_live_audio", code: -32,
+          userInfo: [NSLocalizedDescriptionKey: "Session start cancelled before audio session setup."])
+      }
       try audioSession.setCategory(
         .playAndRecord,
         mode: .voiceChat,
@@ -1126,6 +1133,10 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     let maxAttempts = 3
     var lastThrownError: Error?
 
+    if retiredFromEngine {
+      throw NSError(domain: "mindbend_gemini_live_audio", code: -33,
+        userInfo: [NSLocalizedDescriptionKey: "Plugin was detached from its engine."])
+    }
     for attempt in 1...maxAttempts {
       do {
         try audioSession.setActive(true, options: [])
@@ -1180,7 +1191,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
   }
 
   private func recoverAudioSessionLocked(trigger: String) {
-    guard isSessionRunning else { return }
+    guard isSessionRunning, !retiredFromEngine else { return }
     do {
       try audioSession.setCategory(
         .playAndRecord,
@@ -1551,7 +1562,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     cancelPlaybackProbesLocked()
     sessionStartedAtMs = nil
 
-    if restoreAudioSession {
+    if restoreAudioSession && !retiredFromEngine {
       do {
         if let previousCategory, let previousMode {
           try audioSession.setCategory(previousCategory, mode: previousMode, options: previousOptions)
@@ -1594,7 +1605,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       guard let self else { return }
       if let stamp, !self.captureDelivery.admits(stamp) { return }
       guard stamp != nil, let sink = self.captureEventSink else {
-        if self.captureDelivery.isDetached { return }
+        if self.captureDelivery.isDetached || self.captureEventSink != nil { return }
         if !self.captureSinkMissingLogged {
           self.captureSinkMissingLogged = true
           self.emitEvent("capture_sink_missing")
