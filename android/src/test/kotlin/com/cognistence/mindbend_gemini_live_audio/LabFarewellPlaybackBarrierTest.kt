@@ -67,6 +67,21 @@ class LabFarewellPlaybackBarrierTest {
         barrier.end(id, chunks.size, chunks.sum().toLong())
     }
 
+    /** Review 1a798d2c HIGH-1: BEGIN is still queued on the data lane (behind a parked legacy write) when the
+     *  Dart side cancels the turn. The cancel must still win once BEGIN runs: never a drain for that turn. */
+    @Test fun r22_cancelArrivingBeforeItsQueuedBeginStillCancelsTheTurn() {
+        barrier.cancel("fw_T", "cancelled")       // the method channel runs first
+        barrier.begin("fw_T", 11)                   // BEGIN, PUSH, END reach the data lane afterwards
+        assertTrue("a cancelled turn accepts no audio", !barrier.push("fw_T", 0, pcm(2400)))
+        barrier.end("fw_T", 1, 2400)
+        track.consume(2400); now += 50; track.drainPipeline(); barrier.poll()
+        assertEquals(listOf(FarewellBarrierEvent.Unverified("fw_T", 11, "cancelled")), events)
+        events.clear()
+        turn(2400, id = "fw_U")                    // an unrelated later turn is unaffected
+        track.consume(2400); now += 50; track.drainPipeline(); barrier.poll()
+        assertTrue(events.single() is FarewellBarrierEvent.Drained)
+    }
+
     @Test fun k1_drainsOnlyWhenPresentedTimestampReachesLastFrame() {
         turn(2400, 2400)
         track.consume(4800); barrier.poll()        // all written frames consumed (head = 4800) ...

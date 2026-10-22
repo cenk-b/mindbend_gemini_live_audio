@@ -74,3 +74,10 @@ final class PluginFarewellPlayer: FarewellPlayer {
 
   func stop() { if let node, node.engine != nil { node.stop() } }
 }
+
+/// Lets a lifetime's stop closure reach the barrier built after it. WEAK (review 1a798d2c MEDIUM-4): the barrier
+/// owns its player, the player owns the lifetime and the lifetime owns this closure, so a strong reference here
+/// would keep every session's player, barrier and lifetime alive forever. The plugin's `farewellBarrier` owns it.
+final class FarewellBarrierBox {
+  weak var barrier: FarewellPlaybackBarrier?
+}

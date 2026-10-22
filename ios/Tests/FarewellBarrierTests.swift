@@ -22,7 +22,9 @@ final class FakePlayer: FarewellPlayer {
   var naturallyPlayed: Set<Int> = []        // ground truth: buffer indices whose end + latency was really reached
   func host(_ p: Int64) -> UInt64 { UInt64(Int64(hostBase) + p) }
   func currentSampleTime() -> Int64? { pos }
-  func renderAnchor() -> (sampleTime: Int64, hostTime: UInt64)? { pos.map { ($0, host($0)) } }
+  /// When set, the render clock is frozen at this anchor (rendering stalled) while the host clock moves on.
+  var frozenAnchor: (sampleTime: Int64, hostTime: UInt64)?
+  func renderAnchor() -> (sampleTime: Int64, hostTime: UInt64)? { frozenAnchor ?? pos.map { ($0, host($0)) } }
   func presentationLatencyFrames() -> Int64 { latency }
   func schedule(pcm16: Data, atSampleTime: Int64, onPlayedBack: @escaping (UInt64) -> Void) -> Bool {
     scheduled.append((atSampleTime, atSampleTime + Int64(pcm16.count / 2), onPlayedBack, false))
@@ -141,6 +143,42 @@ final class FarewellBarrierUnitTests: XCTestCase {
     player.pos = nil                                   // node not rendering when the barrier judges it
     player.scheduled[0].fired = true; player.scheduled[0].cb(player.host(5000)); flush()
     XCTAssertEqual(events, [.unverified(turnId: "fw_T", nativeGeneration: 11, reason: "played_back_without_position")])
+  }
+
+  func testI23_cancelArrivingBeforeItsBeginStillCancelsTheTurn() {
+    // Review 1a798d2c HIGH-1 (iOS analogue): farewellBegin hops through the session queue, farewellCancel does
+    // not, so the cancel can reach the barrier first. It must still win.
+    barrier.cancel(turnId: "fw_T", reason: "cancelled")
+    barrier.begin(turnId: "fw_T", nativeGeneration: 11)
+    _ = barrier.push(turnId: "fw_T", seq: 0, pcm16: pcm(480))
+    barrier.end(turnId: "fw_T", totalChunks: 1, totalFrames: 480)
+    player.advance(to: 100_000); flush()
+    XCTAssertEqual(events, [.unverified(turnId: "fw_T", nativeGeneration: 11, reason: "cancelled")])
+    events = []
+    playTurn([480], id: "fw_U")
+    player.advance(to: 200_000); flush()
+    guard case .drained(let id, _, _, _, _, _) = events.first else { return XCTFail("expected drained, got \(events)") }
+    XCTAssertEqual(id, "fw_U")
+  }
+
+  func testI21_staleRenderAnchorIsNeverExtrapolatedIntoADrain() {
+    // Review 1a798d2c HIGH-2: rendering stopped at frame 3000; a discard callback arrives 200 ms of host time
+    // later. Extrapolating from the frozen anchor would claim frame 7800 >= 7200 + 528. It must not drain.
+    playTurn([4800])                       // 2400 ..< 7200
+    player.frozenAnchor = (3000, player.host(3000))
+    player.scheduled[0].fired = true
+    player.scheduled[0].cb(player.host(3000) + 4800); flush()
+    guard case .unverified(_, _, let reason) = events.first else { return XCTFail("expected unverified, got \(events)") }
+    XCTAssertTrue(reason.hasPrefix("render_anchor_stale"), reason)
+  }
+
+  func testI22_freshAnchorJustBeforeTheCallbackStillDrains() {
+    playTurn([4800])
+    player.advance(to: 7200 + 528 - 240)   // anchor 10 ms before the instant end + latency is reached
+    player.frozenAnchor = (7200 + 528 - 240, player.host(7200 + 528 - 240))
+    player.scheduled[0].fired = true
+    player.scheduled[0].cb(player.host(7200 + 528)); flush()
+    guard case .drained = events.first else { return XCTFail("expected drained, got \(events)") }
   }
 
   func testI11_positionIsTheOneCapturedAtCallbackTimeNotLater() {
@@ -400,6 +438,33 @@ final class FarewellBarrierAVFoundationTests: XCTestCase {
   }
   func wait(_ s: Double) { RunLoop.current.run(until: Date().addingTimeInterval(s)) }
   func pcm(_ frames: Int) -> Data { Data(count: frames * 2) }
+
+  func testP4_aStoppedSessionReleasesItsLifetimeBarrierAndPlayer() throws {
+    // Review 1a798d2c MEDIUM-4: the plugin's session graph (lifetime -> stop closure -> box -> barrier -> player
+    // -> lifetime) must not be a retain cycle once the plugin drops its references.
+    weak var weakLifetime: RetiringPlaybackLifetime?
+    weak var weakBarrier: FarewellPlaybackBarrier?
+    let engine = AVAudioEngine()
+    let node = AVAudioPlayerNode()
+    engine.attach(node)
+    let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24_000, channels: 1, interleaved: true)!
+    do {
+      let box = FarewellBarrierBox()
+      let lifetime = RetiringPlaybackLifetime(stop: { box.barrier?.invalidateAsync(reason: "playback_retired"); node.stop() })
+      var barrier: FarewellPlaybackBarrier? = FarewellPlaybackBarrier(
+        player: PluginFarewellPlayer(engine: engine, node: node, format: format, lifetime: lifetime), emit: { _ in })
+      box.barrier = barrier
+      weakLifetime = lifetime
+      weakBarrier = barrier
+      let stopped = expectation(description: "stopped")
+      lifetime.cancel { _ in stopped.fulfill() }
+      wait(for: [stopped], timeout: 3)
+      barrier = nil
+    }
+    wait(0.2)
+    XCTAssertNil(weakBarrier, "barrier leaked")
+    XCTAssertNil(weakLifetime, "lifetime leaked")
+  }
 
   func testA1_realDataPlayedBackDrainsTheFarewell() throws {
     let (_, b, events) = try make()

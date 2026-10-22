@@ -3,6 +3,7 @@ package com.cognistence.mindbend_gemini_live_audio
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
+import java.util.concurrent.atomic.AtomicLong
 
 class FarewellPlaybackBarrierTest {
     @Test
@@ -70,5 +71,18 @@ class FarewellPlaybackBarrierTest {
         val reset = gate.resetForNewSession()
         assertEquals(false, reset["restartBlocked"])
         assertEquals("idle", reset["state"])
+    }
+
+    /** Review 1a798d2c HIGH-3: a startSession queued before detach must be refused when it finally runs. */
+    @Test
+    fun detachRefusesAStartQueuedBeforeIt() {
+        val generation = AtomicLong(0)
+        val fence = PluginDetachFence(generation)
+        val queuedStart = generation.get()
+        assertEquals(true, fence.admits(queuedStart))
+        fence.detach()
+        assertEquals(true, fence.detached)
+        assertEquals(false, fence.admits(queuedStart))
+        assertEquals(false, fence.admits(generation.get()), "nothing is admitted after detach")
     }
 }

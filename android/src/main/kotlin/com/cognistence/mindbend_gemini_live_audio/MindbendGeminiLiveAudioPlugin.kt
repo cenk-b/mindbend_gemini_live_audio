@@ -47,6 +47,9 @@ class MindbendGeminiLiveAudioPlugin :
     private val isSessionRunning = AtomicBoolean(false)
     private val playbackGeneration = AtomicLong(0)
     private val sessionControlGeneration = AtomicLong(0)
+    /** Review 1a798d2c HIGH-3 / MEDIUM-5: once detached, no queued start may open audio and no posted delivery
+     *  may reach a sink of the removed channels. */
+    private val detachFence = PluginDetachFence(sessionControlGeneration)
     private val sessionExecutor = Executors.newSingleThreadExecutor()
     private val farewellDrain = FarewellDrainGate()
     @Volatile private var playbackLifetime: RetiringPlaybackLifetime? = null
@@ -313,6 +316,9 @@ class MindbendGeminiLiveAudioPlugin :
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        detachFence.detach()
+        capturedAudioSink = null
+        eventSink = null
         stopSessionInternal(restoreAudioState = true)
         methodChannel.setMethodCallHandler(null)
         capturedAudioChannel.setStreamHandler(null)
@@ -324,7 +330,7 @@ class MindbendGeminiLiveAudioPlugin :
 
     @Synchronized
     private fun startSession(requestGeneration: Long): Map<String, Any?> {
-        if (requestGeneration != sessionControlGeneration.get()) return fallbackResult("session_start_cancelled")
+        if (!detachFence.admits(requestGeneration)) return fallbackResult("session_start_cancelled")
         if (isSessionRunning.get() && playbackLifetime?.isRetired() == true) {
             stopSessionInternal(restoreAudioState = false)
         }
@@ -791,6 +797,7 @@ class MindbendGeminiLiveAudioPlugin :
     private fun emitCapturedAudio(bytes: ByteArray) {
         val sink = capturedAudioSink ?: return
         mainHandler.post {
+            if (detachFence.detached) return@post
             if (!captureFirstChunkDelivered) {
                 captureFirstChunkDelivered = true
                 emitEvent(
@@ -805,6 +812,7 @@ class MindbendGeminiLiveAudioPlugin :
     private fun emitEvent(type: String, details: Map<String, Any?> = emptyMap()) {
         val sink = eventSink ?: return
         mainHandler.post {
+            if (detachFence.detached) return@post
             val payload = hashMapOf<String, Any?>(
                 "type" to type,
                 "platform" to "android",
@@ -1029,4 +1037,18 @@ class FarewellDrainGate {
     companion object {
         const val NEAR_END_FRAMES = 32
     }
+}
+
+/** Detach fence for queued session work and posted channel deliveries (review 1a798d2c HIGH-3, MEDIUM-5).
+ *  [detach] advances the shared session generation, so any start captured before it is refused. */
+internal class PluginDetachFence(private val generation: AtomicLong) {
+    @Volatile var detached = false
+        private set
+
+    fun detach() {
+        detached = true
+        generation.incrementAndGet()
+    }
+
+    fun admits(requestGeneration: Long): Boolean = !detached && requestGeneration == generation.get()
 }

@@ -43,6 +43,8 @@ protocol FarewellPlayer: AnyObject {
 }
 
 final class FarewellPlaybackBarrier {
+  /// Longest forward projection from a render anchor to a played-back callback (several IO cycles).
+  static let maxForwardProjectionSec: Double = 0.1
   typealias Emit = (FarewellBarrierEvent) -> Void
 
   private struct Turn {
@@ -148,6 +150,12 @@ final class FarewellPlaybackBarrier {
     }
     let start = max(p, legacyEndEstimate) + leadFrames
     turn = Turn(id: id, generation: gen, nextStart: start)
+    if let i = cancelledBeforeBegin.firstIndex(where: { $0.id == id }) {
+      let reason = cancelledBeforeBegin.remove(at: i).reason
+      var t = turn!
+      fail(&t, reason)
+      return
+    }
     log.append("begin \(id) start=\(start)" + (waitedMs > 0 ? " waitedMs=\(waitedMs)" : ""))
   }
 
@@ -210,6 +218,12 @@ final class FarewellPlaybackBarrier {
     // (IOS-1), reconstructed from a render anchor read here, off the handler (IOS-2). No anchor = not rendering.
     guard let a = player.renderAnchor() else { fail(&t, "played_back_without_position"); return }
     let dtSec = (Double(hostAtCallback) - Double(a.hostTime)) / player.hostTicksPerSecond
+    // Review 1a798d2c HIGH-2: projecting FORWARD from an old anchor assumes rendering continued. A stalled
+    // render clock would then "advance" with wall time and verify audio that never played. Only an anchor
+    // within a few IO cycles of the callback may vouch for its position; anything older fails closed.
+    guard dtSec <= FarewellPlaybackBarrier.maxForwardProjectionSec else {
+      fail(&t, "render_anchor_stale(dt=\(Int(dtSec * 1000))ms)"); return
+    }
     let pos = a.sampleTime + Int64((dtSec * player.sampleRate).rounded(.down))
     let required = endFrame + player.presentationLatencyFrames()
     guard pos >= required else {
@@ -231,8 +245,17 @@ final class FarewellPlaybackBarrier {
                   evidence: "ios_dataPlayedBack+position"))
   }
 
+  /// Turns cancelled before their BEGIN reached this queue (review 1a798d2c HIGH-1: farewellBegin hops through
+  /// the plugin's session queue, farewellCancel does not), oldest first, bounded.
+  private var cancelledBeforeBegin: [(id: String, reason: String)] = []
+
   private func _cancel(_ id: String, _ reason: String) {
-    guard turn?.id == id else { return }
+    guard turn?.id == id else {
+      cancelledBeforeBegin.removeAll { $0.id == id }
+      cancelledBeforeBegin.append((id, reason))
+      if cancelledBeforeBegin.count > 16 { cancelledBeforeBegin.removeFirst() }
+      return
+    }
     _invalidate(reason, stopPlayer: true)
   }
 

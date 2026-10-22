@@ -25,3 +25,7 @@ let package = Package(
 )
 PKG
 cd "$WORK" && swift test 2>&1
+# Review 1a798d2c MEDIUM-6: the main.swift lab cases (blocked-operation, nested cancellation, late return) run in
+# every standard host run too, against the same copied sources.
+swiftc -O "$WORK/Sources/FarewellBarrier/RetiringPlaybackLifetime.swift" "$HERE/main.swift" -o "$WORK/lifetime-lab" 2>&1
+"$WORK/lifetime-lab"

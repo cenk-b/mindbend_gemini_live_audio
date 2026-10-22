@@ -1,6 +1,12 @@
 package com.cognistence.mindbend_gemini_live_audio
 import java.util.concurrent.*
 import java.util.concurrent.atomic.*
+import org.junit.Test
+
+/** Review 1a798d2c MEDIUM-6: the lab cases below also run under standard JUnit/Gradle discovery. */
+class RetiringPlaybackLifetimeTest {
+    @Test fun labCases() = main()
+}
 
 private fun checkThat(value: Boolean, message: String) { check(value) { message } }
 fun main() {

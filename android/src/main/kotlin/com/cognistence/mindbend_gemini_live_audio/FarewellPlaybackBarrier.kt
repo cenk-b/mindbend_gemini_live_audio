@@ -39,6 +39,7 @@ sealed class FarewellBarrierEvent {
 }
 
 private const val FLUSHED_DURING_WRITE = -100_000
+private const val MAX_EARLY_CANCELS = 16
 
 class FarewellPlaybackBarrier(
     private val track: FarewellTrackPort,
@@ -116,13 +117,18 @@ class FarewellPlaybackBarrier(
      *  write in flight clears it, every farewell fails closed with track_unsynced (adapter obligation). */
     @Synchronized fun needsResync(): Boolean = unsynced
 
+    /** Turns cancelled before their BEGIN reached the data lane (review 1a798d2c HIGH-1), bounded. */
+    private val cancelledBeforeBegin = LinkedHashMap<String, String>()
+
     @Synchronized fun begin(turnId: String, nativeGeneration: Int) {
         turn?.takeIf { !it.terminal }?.let { fail(it, "replaced") }
         epoch++
         val t = Turn(turnId, nativeGeneration, track.routedDeviceId(), nowMs(), nanoNow())
         turn = t
         log += "begin $turnId written=$writtenFrames"
-        if (unsynced) fail(t, "track_unsynced") else if (flushing) fail(t, "track_flushing")
+        val cancelled = cancelledBeforeBegin.remove(turnId)
+        if (cancelled != null) fail(t, cancelled)
+        else if (unsynced) fail(t, "track_unsynced") else if (flushing) fail(t, "track_flushing")
     }
 
     /** Ordinary (non-farewell) audio keeps the existing path; it only advances the frame accounting. Legacy audio
@@ -277,8 +283,13 @@ class FarewellPlaybackBarrier(
     }
 
     @Synchronized fun cancel(turnId: String, reason: String) {
-        val t = turn ?: return
-        if (t.id == turnId) invalidate(reason)
+        val t = turn
+        if (t != null && t.id == turnId) { invalidate(reason); return }
+        // BEGIN may still be queued behind a parked write on the data lane: remember the cancel for it.
+        cancelledBeforeBegin[turnId] = reason
+        while (cancelledBeforeBegin.size > MAX_EARLY_CANCELS) {
+            cancelledBeforeBegin.remove(cancelledBeforeBegin.keys.first())
+        }
     }
 
     /** Pause/flush/stop/route/recovery from the plugin: the active farewell can never drain. */

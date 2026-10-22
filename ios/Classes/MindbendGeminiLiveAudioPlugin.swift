@@ -1599,6 +1599,3 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
 }
 
 /// Lets a lifetime's stop closure reach the barrier that is created after the lifetime.
-private final class FarewellBarrierBox {
-  var barrier: FarewellPlaybackBarrier?
-}
