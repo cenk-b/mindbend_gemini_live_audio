@@ -85,7 +85,8 @@ void main() {
     final t0 = DateTime.now().millisecondsSinceEpoch;
     expect(await plugin.endFarewell(turnId: id, totalChunks: 4, totalFrames: 9600), isTrue);
     final e = await outcome(id);
-    expect(e, isA<FarewellPlaybackDrained>(), reason: (e is FarewellPlaybackUnverified) ? e.reason : '');
+    expect(e, isA<FarewellPlaybackDrained>(),
+        reason: (e is FarewellPlaybackUnverified) ? '${e.reason} native=${raw.map((r) => r.type).toList()}' : '');
     final d = e as FarewellPlaybackDrained;
     expect(d.nativeGeneration, gen);
     expect(d.framesPlayed, 9600);
@@ -94,6 +95,34 @@ void main() {
     expect(d.drainedAtEpochMs, greaterThanOrEqualTo(t0 - 600), reason: 'not before the audio could have played');
     // ignore: avoid_print
     print('T21_NATIVE drained ${d.turnId} at=${d.drainedAtEpochMs} evidence=${d.evidence} endToDrainMs=${d.drainedAtEpochMs - t0}');
+  });
+
+  testWidgets('positive: a short farewell drains in every fresh session (Group A iOS continuity)', (tester) async {
+    if (!nativeSession()) return;
+    // The failing iPhone case: a short (200 ms) farewell right after a session (re)start. Each cycle is a fresh
+    // native session; the drain must come from the platform barrier, not from END or a timer.
+    for (var cycle = 0; cycle < 3; cycle++) {
+      await plugin.stopSession();
+      await sub?.cancel();
+      sub = plugin.eventStream.listen((e) {
+        raw.add(e);
+        final parsed = FarewellPlaybackEvent.tryParse(e);
+        if (parsed != null) events.add(parsed);
+      });
+      start = await plugin.startSession();
+      expect(start!.isNativeAec, isTrue);
+      await plugin.pushPlaybackPcm(_pcm(4800));
+      await Future<void>.delayed(const Duration(milliseconds: 1500));
+      final id = 'fw_fresh_${gen++}';
+      expect(await plugin.beginFarewell(turnId: id, nativeGeneration: gen), isTrue);
+      expect(await plugin.pushFarewell(turnId: id, seq: 0, pcm: _pcm(4800)), isTrue,
+          reason: 'native=${raw.where((r) => r.type.startsWith('farewell') || r.type.startsWith('route') || r.type.startsWith('interru') || r.type.startsWith('media')).map((r) => '${r.type}:${r.data['reason'] ?? ''}').toList()}');
+      expect(await plugin.endFarewell(turnId: id, totalChunks: 1, totalFrames: 4800), isTrue);
+      final e = await outcome(id);
+      // ignore: avoid_print
+      print('T21_NATIVE fresh cycle=$cycle -> ${e is FarewellPlaybackUnverified ? e.reason : 'drained'}');
+      expect(e, isA<FarewellPlaybackDrained>(), reason: (e is FarewellPlaybackUnverified) ? e.reason : '');
+    }
   });
 
   testWidgets('negative: a barge-in flush during the farewell is never a drain', (tester) async {
