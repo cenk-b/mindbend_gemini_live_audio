@@ -1,5 +1,10 @@
 ## Unreleased (candidate for 0.0.15)
 
+* iOS: fix a deadlock that could hang `stopSession`/`startSession` forever (present in v0.0.14). The mixer and
+  capture tap blocks emitted session snapshots on AVAudioEngine's render threads, and a snapshot reads
+  `engine.inputNode`; a concurrent `AVAudioPlayerNode.stop()` holds the engine lock while it waits for that tap
+  thread. Those three snapshots (`playback_startup_confirmed`, `playback_mixer_buffer_first`,
+  `capture_buffer_first`) are now emitted from the session queue, and a tap thread never touches the engine.
 * iOS farewell barrier: playback-lifetime continuity (Group A).
   * New `RenderLifetimeFence`: the plugin advances a render-lifetime generation BEFORE every operation that can end
     or restart the player's render timeline (node stop/reset, play() on a stopped node, engine start/stop/reset,

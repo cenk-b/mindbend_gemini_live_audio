@@ -997,7 +997,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       if nonZeroRatio > 0.05 || rmsNormalized > 0.002 {
         playbackStartupConfirmed = true
         clearStartupPlaybackReplayLocked()
-        emitSessionSnapshotLocked(
+        emitSessionSnapshotFromRenderThread(
           "playback_startup_confirmed",
           [
             "nonZeroRatio": nonZeroRatio,
@@ -1017,10 +1017,21 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
       for (key, value) in stats {
         details[key] = value
       }
-      emitSessionSnapshotLocked(
+      emitSessionSnapshotFromRenderThread(
         "playback_mixer_buffer_first",
         details
       )
+    }
+  }
+
+  /// The tap blocks run on AVAudioEngine render/messenger threads. A session snapshot reads
+  /// `engine.inputNode`, which takes the engine's internal lock; `AVAudioPlayerNode.stop()` on another
+  /// queue holds that lock while it synchronously waits for the tap thread, so reading it here deadlocks
+  /// stop/start (observed: stopSession never returned). Never touch the engine from a tap thread: hop.
+  private func emitSessionSnapshotFromRenderThread(_ type: String, _ details: [String: Any?]) {
+    sessionQueue.async { [weak self] in
+      guard let self, self.isSessionRunning else { return }
+      self.emitSessionSnapshotLocked(type, details)
     }
   }
 
@@ -1369,7 +1380,7 @@ public final class MindbendGeminiLiveAudioPlugin: NSObject, FlutterPlugin {
     if !captureFirstBufferLogged {
       captureFirstBufferLogged = true
       cancelCaptureStallProbesLocked()
-      emitSessionSnapshotLocked(
+      emitSessionSnapshotFromRenderThread(
         "capture_buffer_first",
         [
           "sampleRateHz": Int(buffer.format.sampleRate),
